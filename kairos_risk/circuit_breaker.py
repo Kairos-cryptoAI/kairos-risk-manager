@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
+from typing import Dict
 
 from kairos_core.enums import SystemMode
 
@@ -62,3 +63,49 @@ class CircuitBreaker:
     @property
     def llm_allowed(self) -> bool:
         return self.state is not BreakerState.OPEN
+
+
+class CircuitBreakerRegistry:
+    """Per-model circuit breakers collapsed into one global :class:`SystemMode`.
+
+    Granular degradation from the updated architecture document:
+      * DeepSeek-V4-Flash down  -> ``TEXT_LOCAL_FILTER`` (Text Scouts filter locally).
+      * GPT-5.5 down            -> ``CONFLICT_SAFE`` (conflicts forced to WAIT_CONFIRMATION).
+      * two or more models down -> ``LOCAL_QUANT_MODE`` (local stop-loss scripts only).
+    A lone DeepSeek-V4-Pro outage stays ``NORMAL``: the Router escalates the routine
+    flow to GPT-5.5 until Pro recovers.
+    """
+
+    FLASH = "deepseek-v4-flash"
+    PRO = "deepseek-v4-pro"
+    GPT = "gpt-5.5"
+
+    def __init__(self, max_consecutive_failures: int = 2, cooldown_s: float = 300.0) -> None:
+        self._max = max_consecutive_failures
+        self._cooldown = cooldown_s
+        self._breakers: Dict[str, CircuitBreaker] = {}
+
+    def breaker(self, model: str) -> CircuitBreaker:
+        return self._breakers.setdefault(model, CircuitBreaker(self._max, self._cooldown))
+
+    def record_failure(self, model: str, *, now: float | None = None) -> BreakerState:
+        return self.breaker(model).record_failure(now=now)
+
+    def record_success(self, model: str) -> BreakerState:
+        return self.breaker(model).record_success()
+
+    def is_down(self, model: str) -> bool:
+        return not self.breaker(model).llm_allowed
+
+    @property
+    def system_mode(self) -> SystemMode:
+        flash_down = self.is_down(self.FLASH)
+        pro_down = self.is_down(self.PRO)
+        gpt_down = self.is_down(self.GPT)
+        if sum((flash_down, pro_down, gpt_down)) >= 2:
+            return SystemMode.LOCAL_QUANT_MODE
+        if gpt_down:
+            return SystemMode.CONFLICT_SAFE
+        if flash_down:
+            return SystemMode.TEXT_LOCAL_FILTER
+        return SystemMode.NORMAL

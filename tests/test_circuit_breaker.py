@@ -28,3 +28,38 @@ def test_half_opens_after_cooldown():
     assert cb._state is BreakerState.HALF_OPEN
     cb.record_success()
     assert cb.system_mode is SystemMode.NORMAL
+
+
+from kairos_risk.circuit_breaker import CircuitBreakerRegistry
+
+
+def _trip(reg, model):
+    # Trip with real (monotonic) time so the breaker stays OPEN within the cooldown.
+    for _ in range(3):
+        reg.record_failure(model)
+
+
+def test_flash_down_enters_text_local_filter():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.FLASH)
+    assert reg.system_mode is SystemMode.TEXT_LOCAL_FILTER
+
+
+def test_gpt_down_enters_conflict_safe():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.GPT)
+    assert reg.system_mode is SystemMode.CONFLICT_SAFE
+
+
+def test_two_models_down_enters_local_quant_mode():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.FLASH)
+    _trip(reg, CircuitBreakerRegistry.GPT)
+    assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+
+def test_recovery_returns_to_normal():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.GPT)
+    reg.record_success(CircuitBreakerRegistry.GPT)
+    assert reg.system_mode is SystemMode.NORMAL
