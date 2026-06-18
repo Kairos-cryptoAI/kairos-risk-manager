@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 
 from kairos_core.bus import build_bus
-from kairos_core.contracts import TacticalCommand
+from kairos_core.contracts import LLMHealthEvent, TacticalCommand
 from kairos_core.contracts.base import KairosMessage
 from kairos_core.enums import SystemMode
 from kairos_core.logging import configure_logging, get_logger
@@ -51,11 +51,20 @@ class RiskService:
     def record_llm_success(self, model: str) -> None:
         self.breakers.record_success(model)
 
-    async def run(self) -> None:
-        configure_logging(self.settings.log_level, json_logs=self.settings.log_json,
-                          service=self.settings.service_name)
-        log.info("risk.start")
-        async for env in self.bus.subscribe(Topics.TACTICAL_COMMAND, group="risk", consumer="c1"):
+    def apply_health_event(self, *, model: str, ok: bool, kind: str = "ok") -> SystemMode:
+        """Feed one LLM health signal into the per-model breakers; returns the mode.
+
+        Only API-level instability (5xx / timeout) trips a breaker; a healthy call
+        resets it. Bad-output / 4xx signals are ignored (the API answered).
+        """
+        if ok:
+            self.breakers.record_success(model)
+        elif kind in ("5xx", "timeout"):
+            self.breakers.record_failure(model)
+        return self.breakers.system_mode
+
+    async def _consume_commands(self) -> None:
+        async for env in self.bus.subscribe(Topics.TACTICAL_COMMAND, group="risk", consumer="commands"):
             try:
                 cmd = TacticalCommand.model_validate(env.payload)
                 # Placeholder mid-price; production reads it from the latest snapshot cache.
@@ -70,6 +79,23 @@ class RiskService:
                 await self._broadcast_mode()
             finally:
                 await self.bus.ack(Topics.TACTICAL_COMMAND, env, group="risk")
+
+    async def _consume_health(self) -> None:
+        """Drive the per-model breakers from LLM health signals on the bus."""
+        async for env in self.bus.subscribe(Topics.LLM_HEALTH, group="risk", consumer="health"):
+            try:
+                ev = LLMHealthEvent.model_validate(env.payload)
+                mode = self.apply_health_event(model=ev.model, ok=ev.ok, kind=ev.kind)
+                log.debug("risk.llm_health", model=ev.model, ok=ev.ok, kind=ev.kind, mode=mode.value)
+                await self._broadcast_mode()
+            finally:
+                await self.bus.ack(Topics.LLM_HEALTH, env, group="risk")
+
+    async def run(self) -> None:
+        configure_logging(self.settings.log_level, json_logs=self.settings.log_json,
+                          service=self.settings.service_name)
+        log.info("risk.start")
+        await asyncio.gather(self._consume_commands(), self._consume_health())
 
 
 def main() -> None:
