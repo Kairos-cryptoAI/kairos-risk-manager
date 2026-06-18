@@ -10,8 +10,9 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from .account import AccountState
-from .circuit_breaker import CircuitBreaker, BreakerState
+from .circuit_breaker import CircuitBreaker, BreakerState, CircuitBreakerRegistry
 from .pipeline import RiskPipeline
 from .config import RiskSettings
 
-__all__ = ["AccountState", "CircuitBreaker", "BreakerState", "RiskPipeline", "RiskSettings", "__version__"]
+__all__ = ["AccountState", "CircuitBreaker", "BreakerState", "CircuitBreakerRegistry",
+           "RiskPipeline", "RiskSettings", "__version__"]
