@@ -11,7 +11,7 @@ from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 
 from .account import AccountState
-from .circuit_breaker import CircuitBreaker
+from .circuit_breaker import CircuitBreaker, CircuitBreakerRegistry
 from .config import RiskSettings
 from .pipeline import RiskPipeline
 
@@ -28,7 +28,7 @@ class RiskService:
         self.settings = settings or RiskSettings()
         self.bus = build_bus(self.settings)
         self.pipeline = RiskPipeline(self.settings)
-        self.breaker = CircuitBreaker(
+        self.breakers = CircuitBreakerRegistry(
             self.settings.breaker_max_consecutive_failures, self.settings.breaker_cooldown_s
         )
         # In a real deployment this is hydrated from the Execution Engine / exchange.
@@ -36,13 +36,20 @@ class RiskService:
         self._last_mode = SystemMode.NORMAL
 
     async def _broadcast_mode(self) -> None:
-        mode = self.breaker.system_mode
+        mode = self.breakers.system_mode
         if mode != self._last_mode:
             self._last_mode = mode
             await self.bus.publish(Topics.SYSTEM_CONTROL,
                                   _Control(source=self.settings.service_name, mode=mode,
-                                           detail=f"breaker={self.breaker.state.value}"))
-            log.warning("risk.mode_change", mode=mode.value, breaker=self.breaker.state.value)
+                                           detail="per-model circuit breaker"))
+            log.warning("risk.mode_change", mode=mode.value)
+
+    def record_llm_failure(self, model: str) -> None:
+        """Feed an LLM health signal (5xx/timeout) into the per-model breaker."""
+        self.breakers.record_failure(model)
+
+    def record_llm_success(self, model: str) -> None:
+        self.breakers.record_success(model)
 
     async def run(self) -> None:
         configure_logging(self.settings.log_level, json_logs=self.settings.log_json,
