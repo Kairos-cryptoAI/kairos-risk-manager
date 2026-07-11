@@ -67,9 +67,9 @@ class RiskService:
         async for env in self.bus.subscribe(Topics.TACTICAL_COMMAND, group="risk", consumer="commands"):
             try:
                 cmd = TacticalCommand.model_validate(env.payload)
-                # Placeholder mid-price; production reads it from the latest snapshot cache.
-                price = env.payload.get("price") or 0.0
+                price = cmd.reference_price
                 if price <= 0:
+                    # Backward-compatible old commands are safe: refuse to size instead of guessing.
                     log.debug("risk.skip_no_price", symbol=cmd.symbol)
                     continue
                 validated = self.pipeline.validate(cmd, self.account, price=price)
