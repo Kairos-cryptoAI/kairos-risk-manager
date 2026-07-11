@@ -33,6 +33,7 @@ class RiskService:
         )
         # In a real deployment this is hydrated from the Execution Engine / exchange.
         self.account = AccountState(equity_usd=10_000, peak_equity_usd=10_000, reconciled=False)
+        self.account_snapshot: AccountSnapshot | None = None
         self._last_account_ts = 0.0
         self._last_mode = SystemMode.NORMAL
 
@@ -69,22 +70,16 @@ class RiskService:
             try:
                 cmd = TacticalCommand.model_validate(env.payload)
 
-                # Production-only: refuse stale commands if we lack a fresh reconciled account.
-                if self.settings.require_reconciled_account and not self.account.reconciled:
+                # Production-only: refuse commands until an authoritative snapshot is available.
+                if self.settings.require_reconciled_account and self.account_snapshot is None:
                     log.warning("risk.unreconciled_account", symbol=cmd.symbol)
                     continue
 
-                # Build a symbol-aware account state so position sizing sees the actual open exposure.
-                account_for_symbol = AccountState.from_snapshot(
-                    AccountSnapshot(
-                        source="internal", exchange="", account_id="",
-                        equity_usd=self.account.equity_usd, available_balance_usd=0.0,
-                        peak_equity_usd=self.account.peak_equity_usd,
-                        daily_pnl_pct=self.account.daily_pnl_pct,
-                        positions=[], reconciled=self.account.reconciled,
-                    ),
-                    symbol=cmd.symbol,
-                ) if self.account.reconciled else self.account
+                # Extract the signed position for this command's symbol from the full snapshot.
+                account_for_symbol = (
+                    AccountState.from_snapshot(self.account_snapshot, symbol=cmd.symbol)
+                    if self.account_snapshot is not None else self.account
+                )
 
                 price = cmd.reference_price
                 if price <= 0:
@@ -120,18 +115,8 @@ class RiskService:
                     continue
                 import time
                 self._last_account_ts = time.time()
-                # Build per-symbol state later; store raw equity/peak for drawdown gate and allocation.
-                self.account = AccountState(
-                    equity_usd=snapshot.equity_usd,
-                    peak_equity_usd=snapshot.peak_equity_usd,
-                    daily_pnl_pct=snapshot.daily_pnl_pct,
-                    gross_exposure_usd=sum(
-                        abs(p.signed_quantity) * (p.mark_price or p.entry_price or 0.0)
-                        for p in snapshot.positions
-                    ),
-                    open_position_qty=0.0,  # symbol-specific; extracted per command
-                    reconciled=True,
-                )
+                self.account_snapshot = snapshot
+                self.account = AccountState.from_snapshot(snapshot)
                 log.info("risk.account_reconciled", equity=snapshot.equity_usd,
                          positions=len(snapshot.positions))
             finally:

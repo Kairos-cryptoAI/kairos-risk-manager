@@ -2,7 +2,7 @@
 import asyncio
 
 from kairos_core.bus import BusEnvelope
-from kairos_core.contracts import TacticalCommand
+from kairos_core.contracts import AccountSnapshot, PositionSnapshot, TacticalCommand
 from kairos_core.enums import ReasonCode, Side, SystemMode, TacticalStatus
 from kairos_core.topics import Topics
 
@@ -91,6 +91,40 @@ def test_tactical_reference_price_reaches_validated_order():
     assert validated.approved is True
     assert validated.intent.price == command.reference_price
     assert validated.intent.quantity > 0
+
+
+def test_reconciled_snapshot_closes_only_command_symbol_position():
+    command = TacticalCommand(
+        source="aggregator", symbol="BTCUSDT", reference_price=65_000,
+        status=TacticalStatus.EXIT, reason_code=ReasonCode.CLOSE_POSITION,
+    )
+    envelope = BusEnvelope(
+        id="close-1", topic=Topics.TACTICAL_COMMAND, payload=command.to_payload(),
+    )
+    service = RiskService(RiskSettings(bus_backend="memory", require_reconciled_account=True))
+    service.account_snapshot = AccountSnapshot(
+        source="execution", exchange="evedex", account_id="primary",
+        equity_usd=10_000, available_balance_usd=8_000, peak_equity_usd=10_000,
+        positions=[
+            PositionSnapshot(
+                source="execution", exchange="evedex", account_id="primary",
+                symbol="BTCUSDT", signed_quantity=-0.2, mark_price=65_000,
+            ),
+            PositionSnapshot(
+                source="execution", exchange="evedex", account_id="primary",
+                symbol="ETHUSDT", signed_quantity=3.0, mark_price=3_000,
+            ),
+        ],
+        reconciled=True,
+    )
+    service.bus = _OneMessageBus(envelope)
+
+    asyncio.run(service._consume_commands())
+
+    _, validated = service.bus.published[0]
+    assert validated.intent.side.value == "BUY"
+    assert validated.intent.quantity == 0.2
+    assert validated.intent.reduce_only is True
 
 
 def test_legacy_zero_price_command_is_acked_but_never_sized():
