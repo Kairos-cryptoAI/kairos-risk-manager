@@ -11,7 +11,11 @@ from kairos_risk.service import RiskService
 
 
 def _svc() -> RiskService:
-    return RiskService(RiskSettings(bus_backend="memory", require_reconciled_account=False))
+    return RiskService(RiskSettings(
+        bus_backend="memory",
+        require_reconciled_account=False,
+        require_strategic_allocation=False,
+    ))
 
 
 def test_gpt_outage_drives_conflict_safe():
@@ -101,7 +105,11 @@ def test_reconciled_snapshot_closes_only_command_symbol_position():
     envelope = BusEnvelope(
         id="close-1", topic=Topics.TACTICAL_COMMAND, payload=command.to_payload(),
     )
-    service = RiskService(RiskSettings(bus_backend="memory", require_reconciled_account=True))
+    service = RiskService(RiskSettings(
+        bus_backend="memory",
+        require_reconciled_account=True,
+        require_strategic_allocation=False,
+    ))
     service.account_snapshot = AccountSnapshot(
         source="execution", exchange="evedex", account_id="primary",
         equity_usd=10_000, available_balance_usd=8_000, peak_equity_usd=10_000,

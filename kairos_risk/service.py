@@ -4,7 +4,12 @@ from __future__ import annotations
 import asyncio
 
 from kairos_core.bus import build_bus
-from kairos_core.contracts import AccountSnapshot, LLMHealthEvent, TacticalCommand
+from kairos_core.contracts import (
+    AccountSnapshot,
+    LLMHealthEvent,
+    StrategicAllocation,
+    TacticalCommand,
+)
 from kairos_core.contracts.base import KairosMessage
 from kairos_core.enums import SystemMode
 from kairos_core.logging import configure_logging, get_logger
@@ -14,6 +19,7 @@ from .account import AccountState
 from .circuit_breaker import CircuitBreakerRegistry
 from .config import RiskSettings
 from .pipeline import RiskPipeline
+from .strategy import is_fresh
 
 log = get_logger("risk")
 
@@ -34,6 +40,7 @@ class RiskService:
         # In a real deployment this is hydrated from the Execution Engine / exchange.
         self.account = AccountState(equity_usd=10_000, peak_equity_usd=10_000, reconciled=False)
         self.account_snapshot: AccountSnapshot | None = None
+        self.strategic_allocation: StrategicAllocation | None = None
         self._last_account_ts = 0.0
         self._last_mode = SystemMode.NORMAL
 
@@ -81,12 +88,29 @@ class RiskService:
                     if self.account_snapshot is not None else self.account
                 )
 
+                # Strategic allocation applies only to new entries; reduce-only exits remain allowed.
+                allocation = None
+                if self.settings.require_strategic_allocation and cmd.reason_code.value not in {
+                    "CLOSE_POSITION", "HOLD", "NO_TRADE", "REDUCE_LEVERAGE",
+                }:
+                    if self.strategic_allocation is None:
+                        log.warning("risk.no_allocation", symbol=cmd.symbol)
+                        continue
+                    if not is_fresh(
+                        self.strategic_allocation, max_age_s=self.settings.strategic_allocation_max_age_s,
+                    ):
+                        log.warning("risk.stale_allocation", symbol=cmd.symbol)
+                        continue
+                    allocation = self.strategic_allocation
+
                 price = cmd.reference_price
                 if price <= 0:
                     # Backward-compatible old commands are safe: refuse to size instead of guessing.
                     log.debug("risk.skip_no_price", symbol=cmd.symbol)
                     continue
-                validated = self.pipeline.validate(cmd, account_for_symbol, price=price)
+                validated = self.pipeline.validate(
+                    cmd, account_for_symbol, price=price, allocation=allocation,
+                )
                 await self.bus.publish(Topics.VALIDATED_ORDER, validated)
                 log.info("risk.validated", symbol=cmd.symbol, approved=validated.approved,
                         reason=validated.reason_code.value, adjustments=len(validated.adjustments))
@@ -122,12 +146,24 @@ class RiskService:
             finally:
                 await self.bus.ack(Topics.ACCOUNT_SNAPSHOT, env, group="risk")
 
+    async def _consume_allocation(self) -> None:
+        """Receive strategic allocations; update internal constraint state."""
+        async for env in self.bus.subscribe(Topics.STRATEGIC_ALLOCATION, group="risk", consumer="allocation"):
+            try:
+                allocation = StrategicAllocation.model_validate(env.payload)
+                self.strategic_allocation = allocation
+                log.info("risk.allocation_updated", regime=allocation.regime.value,
+                         max_leverage=allocation.max_gross_leverage, stable=allocation.stable_reserve_pct)
+            finally:
+                await self.bus.ack(Topics.STRATEGIC_ALLOCATION, env, group="risk")
+
     async def run(self) -> None:
         configure_logging(self.settings.log_level, json_logs=self.settings.log_json,
                           service=self.settings.service_name)
         log.info("risk.start")
         await asyncio.gather(
             self._consume_commands(), self._consume_health(), self._consume_account(),
+            self._consume_allocation(),
         )
 
 
