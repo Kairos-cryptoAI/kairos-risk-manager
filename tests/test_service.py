@@ -11,7 +11,7 @@ from kairos_risk.service import RiskService
 
 
 def _svc() -> RiskService:
-    return RiskService(RiskSettings(bus_backend="memory"))
+    return RiskService(RiskSettings(bus_backend="memory", require_reconciled_account=False))
 
 
 def test_gpt_outage_drives_conflict_safe():

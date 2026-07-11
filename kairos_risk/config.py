@@ -20,6 +20,7 @@ class RiskSettings(CoreSettings):
     per_trade_risk_fraction: float = 0.02   # fraction of equity risked per entry
     max_position_notional_usd: float = 250_000.0
     min_notional_usd: float = 5.0           # EVEDEX minimum notional
+    require_reconciled_account: bool = True
 
     # Circuit breaker.
     breaker_max_consecutive_failures: int = 2   # trips when exceeded (i.e. on the 3rd)
