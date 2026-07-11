@@ -76,6 +76,9 @@ class RiskService:
         async for env in self.bus.subscribe(Topics.TACTICAL_COMMAND, group="risk", consumer="commands"):
             try:
                 cmd = TacticalCommand.model_validate(env.payload)
+                if not self.settings.symbol_allowed(cmd.symbol):
+                    log.warning("risk.symbol_rejected", symbol=cmd.symbol)
+                    continue
 
                 # Production-only: refuse commands until an authoritative snapshot is available.
                 if self.settings.require_reconciled_account and self.account_snapshot is None:
