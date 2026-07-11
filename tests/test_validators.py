@@ -1,4 +1,3 @@
-import pytest
 from kairos_risk.config import RiskSettings
 from kairos_risk.validators import cap_leverage, drawdown_gate, enforce_min_notional
 from kairos_risk.account import AccountState

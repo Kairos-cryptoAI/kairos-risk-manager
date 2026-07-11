@@ -11,7 +11,7 @@ from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 
 from .account import AccountState
-from .circuit_breaker import CircuitBreaker, CircuitBreakerRegistry
+from .circuit_breaker import CircuitBreakerRegistry
 from .config import RiskSettings
 from .pipeline import RiskPipeline
 

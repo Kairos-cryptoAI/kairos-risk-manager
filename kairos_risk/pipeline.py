@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from kairos_core.contracts import OrderIntent, TacticalCommand, ValidatedOrder
-from kairos_core.enums import OrderSide, OrderType, ReasonCode, Side
+from kairos_core.enums import OrderSide, OrderType, ReasonCode
 
 from .account import AccountState
 from .config import RiskSettings

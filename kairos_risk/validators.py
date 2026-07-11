@@ -19,8 +19,8 @@ def cap_leverage(requested: float, settings: RiskSettings) -> Tuple[float, Optio
     if requested > settings.hard_leverage_limit:
         # Treated as a model error -> forcibly reduced to the safe cap.
         return settings.safe_leverage_cap, (
-            f"leverage {requested:g}x exceeds hard limit "
-            f"{settings.hard_leverage_limit:g}x -> capped to {settings.safe_leverage_cap:g}x (suspected error)"
+            f"leverage {requested:g}x exceeds hard limit {settings.hard_leverage_limit:g}x "
+            f"-> capped to {settings.safe_leverage_cap:g}x (suspected error)"
         )
     if requested > settings.max_allowed_leverage:
         return settings.max_allowed_leverage, (
