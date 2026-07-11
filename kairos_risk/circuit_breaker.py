@@ -44,6 +44,11 @@ class CircuitBreaker:
 
     def record_failure(self, *, now: float | None = None) -> BreakerState:
         now = now if now is not None else time.monotonic()
+        self._maybe_half_open(now)
+        # A failed probe while HALF_OPEN re-trips immediately (fresh cooldown).
+        if self._state is BreakerState.HALF_OPEN:
+            self._trip(now)
+            return self._state
         self._consecutive_failures += 1
         if self._consecutive_failures > self.max_consecutive_failures:
             self._trip(now)
