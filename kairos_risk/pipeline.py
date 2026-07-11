@@ -40,14 +40,20 @@ class RiskPipeline:
         if note:
             adjustments.append(note)
 
-        # 4) Direction + sizing.
+        # 4) Direction + sizing. Exits must close the existing position exactly;
+        # entry sizing formulas can otherwise over-close and flip the account.
         side = _SIDE_MAP.get(reason)
-        if side is None:
-            side = OrderSide.SELL if account.open_position_qty > 0 else OrderSide.BUY  # close
-        qty = position_quantity(
-            equity_usd=account.equity_usd, price=price, leverage=leverage,
-            risk_fraction=s.per_trade_risk_fraction, max_notional_usd=s.max_position_notional_usd,
-        )
+        if reason == ReasonCode.CLOSE_POSITION:
+            if account.open_position_qty == 0:
+                adjustments.append("no open position to close")
+                return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+            side = OrderSide.SELL if account.open_position_qty > 0 else OrderSide.BUY
+            qty = abs(account.open_position_qty)
+        else:
+            qty = position_quantity(
+                equity_usd=account.equity_usd, price=price, leverage=leverage,
+                risk_fraction=s.per_trade_risk_fraction, max_notional_usd=s.max_position_notional_usd,
+            )
         qty, note = enforce_min_notional(qty, price, s)
         if note:
             adjustments.append(note)
