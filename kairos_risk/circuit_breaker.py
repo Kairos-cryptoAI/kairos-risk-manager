@@ -4,18 +4,18 @@ Spec: if the LLM API returns 502 / times out more than twice in a row, cut the
 LLM out for 5 minutes and fall back to LOCAL_QUANT_MODE (local stop-loss
 scripts manage open positions in the meantime).
 """
+
 from __future__ import annotations
 
 import time
-from enum import Enum
-from typing import Dict
+from enum import StrEnum
 
 from kairos_core.enums import SystemMode
 
 
-class BreakerState(str, Enum):
-    CLOSED = "CLOSED"      # healthy, LLM attached
-    OPEN = "OPEN"          # tripped, LLM detached (LOCAL_QUANT_MODE)
+class BreakerState(StrEnum):
+    CLOSED = "CLOSED"  # healthy, LLM attached
+    OPEN = "OPEN"  # tripped, LLM detached (LOCAL_QUANT_MODE)
     HALF_OPEN = "HALF_OPEN"  # cooldown elapsed, probing recovery
 
 
@@ -67,7 +67,9 @@ class CircuitBreaker:
 
     @property
     def llm_allowed(self) -> bool:
-        return self.state is not BreakerState.OPEN
+        # HALF_OPEN is still degraded until an explicit successful health event
+        # closes the breaker. This prevents risk from reopening during a probe.
+        return self.state is BreakerState.CLOSED
 
 
 class CircuitBreakerRegistry:
@@ -75,20 +77,20 @@ class CircuitBreakerRegistry:
 
     Granular degradation from the updated architecture document:
       * DeepSeek-V4-Flash down  -> ``TEXT_LOCAL_FILTER`` (Text Scouts filter locally).
-      * GPT-5.5 down            -> ``CONFLICT_SAFE`` (conflicts forced to WAIT_CONFIRMATION).
+      * GPT-5.6 Sol down        -> ``CONFLICT_SAFE`` (conflicts forced to WAIT_CONFIRMATION).
       * two or more models down -> ``LOCAL_QUANT_MODE`` (local stop-loss scripts only).
     A lone DeepSeek-V4-Pro outage stays ``NORMAL``: the Router escalates the routine
-    flow to GPT-5.5 until Pro recovers.
+    flow to GPT-5.6 Sol until Pro recovers.
     """
 
     FLASH = "deepseek-v4-flash"
     PRO = "deepseek-v4-pro"
-    GPT = "gpt-5.5"
+    GPT = "gpt-5.6-sol"
 
     def __init__(self, max_consecutive_failures: int = 2, cooldown_s: float = 300.0) -> None:
         self._max = max_consecutive_failures
         self._cooldown = cooldown_s
-        self._breakers: Dict[str, CircuitBreaker] = {}
+        self._breakers: dict[str, CircuitBreaker] = {}
 
     def breaker(self, model: str) -> CircuitBreaker:
         return self._breakers.setdefault(model, CircuitBreaker(self._max, self._cooldown))

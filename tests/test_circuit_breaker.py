@@ -1,12 +1,13 @@
-from kairos_risk.circuit_breaker import CircuitBreaker, CircuitBreakerRegistry, BreakerState
 from kairos_core.enums import SystemMode
+
+from kairos_risk.circuit_breaker import BreakerState, CircuitBreaker, CircuitBreakerRegistry
 
 
 def test_trips_after_more_than_two_consecutive_failures():
     cb = CircuitBreaker(max_consecutive_failures=2, cooldown_s=300)
-    assert cb.record_failure() is BreakerState.CLOSED   # 1
-    assert cb.record_failure() is BreakerState.CLOSED   # 2
-    assert cb.record_failure() is BreakerState.OPEN     # 3 -> trip
+    assert cb.record_failure() is BreakerState.CLOSED  # 1
+    assert cb.record_failure() is BreakerState.CLOSED  # 2
+    assert cb.record_failure() is BreakerState.OPEN  # 3 -> trip
     assert cb.system_mode is SystemMode.LOCAL_QUANT_MODE
     assert cb.llm_allowed is False
 
@@ -29,6 +30,20 @@ def test_half_opens_after_cooldown():
     assert cb._state is BreakerState.HALF_OPEN
     cb.record_success()
     assert cb.system_mode is SystemMode.NORMAL
+
+
+def test_registry_stays_degraded_while_probe_is_half_open():
+    registry = CircuitBreakerRegistry(max_consecutive_failures=2, cooldown_s=300)
+    breaker = registry.breaker(CircuitBreakerRegistry.GPT)
+    for _ in range(3):
+        breaker.record_failure(now=0.0)
+
+    breaker._maybe_half_open(now=301.0)
+
+    assert breaker._state is BreakerState.HALF_OPEN
+    assert registry.system_mode is SystemMode.CONFLICT_SAFE
+    breaker.record_success()
+    assert registry.system_mode is SystemMode.NORMAL
 
 
 def test_failed_half_open_probe_retrips_with_fresh_cooldown():
