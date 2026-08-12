@@ -76,18 +76,20 @@ the entire account at that capture point, including signed quantities and protec
 stop IDs. `reconciled=true` may be set only after balances, positions, and open orders
 have all been fetched and cross-checked successfully.
 
-Execution should publish the snapshot:
+The execution engine publishes the snapshot:
 
 - once at startup, before any live command can be approved;
 - periodically at a cadence comfortably below the configured 60-second maximum age;
-- immediately after order placement, fill, cancellation, protective-stop change, and
-  reconnect;
+- immediately after each handled execution action, in addition to the periodic refresh;
 - with `reconciled=false` and a useful `reconciliation_detail` as soon as an exchange
   read or cross-check fails, so Risk revokes the old state.
 
-Until that publisher exists, the default production configuration correctly refuses new
-orders. Tests may opt out explicitly with `require_reconciled_account=False`; this is not
-a production setting.
+The default production configuration refuses new orders until the first fresh,
+fully-reconciled snapshot arrives, and revokes that permission when reconciliation fails
+or the snapshot becomes stale. Tests may opt out explicitly with
+`require_reconciled_account=False`; this is not a production setting. Exchange events
+that happen outside the command path are observed on the next polling refresh; a private
+exchange event stream remains future work.
 
 ## Windows / PowerShell development
 
