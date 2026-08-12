@@ -1,21 +1,21 @@
 """Minimal view of account state needed for risk decisions."""
+
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
-
 from kairos_core.contracts import AccountSnapshot
+from pydantic import BaseModel, Field
 
 
 class AccountState(BaseModel):
     equity_usd: float = Field(..., gt=0)
     peak_equity_usd: float = Field(..., gt=0)
-    daily_pnl_pct: float = 0.0          # signed; negative means a loss today
+    daily_pnl_pct: float = 0.0  # signed; negative means a loss today
     gross_exposure_usd: float = 0.0
-    open_position_qty: float = 0.0       # signed position for the command symbol
+    open_position_qty: float = 0.0  # signed position for the command symbol
     reconciled: bool = False
 
     @classmethod
-    def from_snapshot(cls, snapshot: AccountSnapshot, *, symbol: str | None = None) -> "AccountState":
+    def from_snapshot(cls, snapshot: AccountSnapshot, *, symbol: str | None = None) -> AccountState:
         positions = snapshot.positions
         selected = next((p for p in positions if p.symbol == symbol), None) if symbol else None
         gross_exposure = sum(

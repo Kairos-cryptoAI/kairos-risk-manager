@@ -1,8 +1,9 @@
 """Deterministic enforcement of Macro Strategist capital allocation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from kairos_core.contracts import StrategicAllocation
 from kairos_core.enums import MarketRegime, ReasonCode
@@ -18,10 +19,10 @@ class StrategicLimits:
 
 
 def is_fresh(allocation: StrategicAllocation, *, max_age_s: float, now: datetime | None = None) -> bool:
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     produced = allocation.produced_at
     if produced.tzinfo is None:
-        produced = produced.replace(tzinfo=timezone.utc)
+        produced = produced.replace(tzinfo=UTC)
     age_s = (current - produced).total_seconds()
     return 0 <= age_s <= max_age_s
 
@@ -43,7 +44,8 @@ def limits_for(
         allowed = False
         notes.append("strategic regime BULL forbids new short trend entries")
     elif allocation.regime is MarketRegime.CHOP and reason in {
-        ReasonCode.ENTER_LONG_TREND, ReasonCode.ENTER_SHORT_TREND,
+        ReasonCode.ENTER_LONG_TREND,
+        ReasonCode.ENTER_SHORT_TREND,
     }:
         allowed = False
         notes.append("strategic regime CHOP forbids new trend entries")

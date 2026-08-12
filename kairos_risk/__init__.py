@@ -5,14 +5,22 @@ brain (Aggregator / Macro-Strategist) and the Execution Engine, and its single
 job is to make sure a hallucinating or malfunctioning model can never blow up
 the account.
 """
+
 from __future__ import annotations
 
 __version__ = "0.1.0"
 
 from .account import AccountState
-from .circuit_breaker import CircuitBreaker, BreakerState, CircuitBreakerRegistry
-from .pipeline import RiskPipeline
+from .circuit_breaker import BreakerState, CircuitBreaker, CircuitBreakerRegistry
 from .config import RiskSettings
+from .pipeline import RiskPipeline
 
-__all__ = ["AccountState", "CircuitBreaker", "BreakerState", "CircuitBreakerRegistry",
-           "RiskPipeline", "RiskSettings", "__version__"]
+__all__ = [
+    "AccountState",
+    "CircuitBreaker",
+    "BreakerState",
+    "CircuitBreakerRegistry",
+    "RiskPipeline",
+    "RiskSettings",
+    "__version__",
+]
