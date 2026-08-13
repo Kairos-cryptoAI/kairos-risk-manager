@@ -32,6 +32,9 @@ _NON_ENTRY_REASONS = {
     ReasonCode.REDUCE_LEVERAGE,
 }
 
+_MODEL_OUTAGE_KINDS = frozenset(("5xx", "timeout", "connection", "rate_limit"))
+_PROVIDER_OUTAGE_KINDS = frozenset(("connection", "rate_limit", "provider_outage"))
+
 
 class _Control(KairosMessage):
     mode: SystemMode
@@ -73,22 +76,44 @@ class RiskService:
         log.warning("risk.mode_change", mode=mode.value)
 
     def record_llm_failure(self, model: str) -> None:
-        """Feed an LLM health signal (5xx/timeout) into the per-model breaker."""
+        """Feed an outage into one model breaker (legacy helper)."""
         self.breakers.record_failure(model)
 
-    def record_llm_success(self, model: str) -> None:
+    def record_llm_success(self, model: str, provider: str | None = None) -> None:
+        """Recover a model and, when known, its aggregate provider breaker."""
         self.breakers.record_success(model)
+        resolved_provider = provider or self.breakers.infer_provider(model)
+        if resolved_provider:
+            self.breakers.record_provider_success(resolved_provider)
 
-    def apply_health_event(self, *, model: str, ok: bool, kind: str = "ok") -> SystemMode:
+    def apply_health_event(
+        self,
+        *,
+        model: str,
+        ok: bool,
+        kind: str = "ok",
+        provider: str | None = None,
+    ) -> SystemMode:
         """Feed one LLM health signal into the per-model breakers; returns the mode.
 
-        Only API-level instability (5xx / timeout) trips a breaker; a healthy call
-        resets it. Bad-output / 4xx signals are ignored (the API answered).
+        Model-level availability failures update the named model. Connection and
+        rate-limit failures also update the aggregate OpenAI breaker because they
+        normally affect the provider/account rather than one model. A healthy call
+        recovers only its model plus its provider aggregate; bad output and permanent
+        HTTP/client errors remain observable without being treated as outages.
         """
+        resolved_provider = provider or self.breakers.infer_provider(model)
         if ok:
-            self.breakers.record_success(model)
-        elif kind in ("5xx", "timeout"):
-            self.breakers.record_failure(model)
+            self.record_llm_success(model, resolved_provider)
+        else:
+            if kind in _MODEL_OUTAGE_KINDS:
+                self.breakers.record_failure(model)
+            if (
+                resolved_provider
+                and self.breakers.normalize_provider(resolved_provider) == CircuitBreakerRegistry.OPENAI
+                and kind in _PROVIDER_OUTAGE_KINDS
+            ):
+                self.breakers.record_provider_failure(resolved_provider)
         return self.breakers.system_mode
 
     def _account_ready(self, *, symbol: str, now: datetime | None = None) -> bool:
@@ -212,10 +237,12 @@ class RiskService:
             model=event.model,
             ok=event.ok,
             kind=event.kind,
+            provider=event.provider,
         )
         log.debug(
             "risk.llm_health",
             model=event.model,
+            provider=event.provider,
             ok=event.ok,
             kind=event.kind,
             mode=mode.value,

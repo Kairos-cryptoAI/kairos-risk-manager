@@ -34,7 +34,7 @@ def test_half_opens_after_cooldown():
 
 def test_registry_stays_degraded_while_probe_is_half_open():
     registry = CircuitBreakerRegistry(max_consecutive_failures=2, cooldown_s=300)
-    breaker = registry.breaker(CircuitBreakerRegistry.GPT)
+    breaker = registry.breaker(CircuitBreakerRegistry.SOL)
     for _ in range(3):
         breaker.record_failure(now=0.0)
 
@@ -70,21 +70,89 @@ def test_flash_down_enters_text_local_filter():
     assert reg.system_mode is SystemMode.TEXT_LOCAL_FILTER
 
 
-def test_gpt_down_enters_conflict_safe():
-    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
-    _trip(reg, CircuitBreakerRegistry.GPT)
-    assert reg.system_mode is SystemMode.CONFLICT_SAFE
+def test_model_outages_map_to_fail_safe_modes():
+    expected_modes = {
+        CircuitBreakerRegistry.FLASH: SystemMode.TEXT_LOCAL_FILTER,
+        CircuitBreakerRegistry.LUNA: SystemMode.LOCAL_QUANT_MODE,
+        CircuitBreakerRegistry.TERRA: SystemMode.CONFLICT_SAFE,
+        CircuitBreakerRegistry.SOL: SystemMode.CONFLICT_SAFE,
+    }
+
+    for model, expected_mode in expected_modes.items():
+        reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+        _trip(reg, model)
+        assert reg.system_mode is expected_mode
 
 
 def test_two_models_down_enters_local_quant_mode():
     reg = CircuitBreakerRegistry(max_consecutive_failures=2)
-    _trip(reg, CircuitBreakerRegistry.FLASH)
-    _trip(reg, CircuitBreakerRegistry.GPT)
+    _trip(reg, CircuitBreakerRegistry.SOL)
+    _trip(reg, CircuitBreakerRegistry.TERRA)
     assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
 
 
 def test_recovery_returns_to_normal():
     reg = CircuitBreakerRegistry(max_consecutive_failures=2)
-    _trip(reg, CircuitBreakerRegistry.GPT)
-    reg.record_success(CircuitBreakerRegistry.GPT)
+    _trip(reg, CircuitBreakerRegistry.SOL)
+    reg.record_success(CircuitBreakerRegistry.SOL)
     assert reg.system_mode is SystemMode.NORMAL
+
+
+def test_openai_provider_outage_enters_local_quant_mode():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    for _ in range(3):
+        reg.record_provider_failure(CircuitBreakerRegistry.OPENAI)
+
+    assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+
+def test_unknown_model_outage_fails_closed():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, "gpt-6-unknown")
+
+    assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+
+def test_legacy_gpt_alias_still_targets_sol():
+    assert CircuitBreakerRegistry.GPT == CircuitBreakerRegistry.SOL
+
+
+def test_recovery_recomputes_mode_from_remaining_outages():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.FLASH)
+    _trip(reg, CircuitBreakerRegistry.TERRA)
+    assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+    reg.record_success(CircuitBreakerRegistry.TERRA)
+    assert reg.system_mode is SystemMode.TEXT_LOCAL_FILTER
+    reg.record_success(CircuitBreakerRegistry.FLASH)
+    assert reg.system_mode is SystemMode.NORMAL
+
+
+def test_provider_half_open_remains_fail_closed():
+    reg = CircuitBreakerRegistry(max_consecutive_failures=2, cooldown_s=300)
+    provider = reg.provider_breaker(CircuitBreakerRegistry.OPENAI)
+    for _ in range(3):
+        provider.record_failure(now=0.0)
+
+    provider._maybe_half_open(now=301.0)
+
+    assert provider._state is BreakerState.HALF_OPEN
+    assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+    provider.record_success()
+    assert reg.system_mode is SystemMode.NORMAL
+
+
+def test_provider_inference_covers_current_and_future_model_families():
+    expected = {
+        CircuitBreakerRegistry.FLASH: "deepseek",
+        "deepseek-v5": "deepseek",
+        CircuitBreakerRegistry.LUNA: "openai",
+        CircuitBreakerRegistry.TERRA: "openai",
+        CircuitBreakerRegistry.SOL: "openai",
+        "gpt-6-future": "openai",
+        "unknown-model": None,
+    }
+
+    for model, provider in expected.items():
+        assert CircuitBreakerRegistry.infer_provider(model) == provider

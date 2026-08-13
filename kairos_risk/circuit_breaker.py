@@ -73,27 +73,52 @@ class CircuitBreaker:
 
 
 class CircuitBreakerRegistry:
-    """Per-model circuit breakers collapsed into one global :class:`SystemMode`.
+    """Model and provider breakers collapsed into one fail-safe ``SystemMode``.
 
-    Granular degradation from the updated architecture document:
-      * DeepSeek-V4-Flash down  -> ``TEXT_LOCAL_FILTER`` (Text Scouts filter locally).
-      * GPT-5.6 Sol down        -> ``CONFLICT_SAFE`` (conflicts forced to WAIT_CONFIRMATION).
-      * two or more models down -> ``LOCAL_QUANT_MODE`` (local stop-loss scripts only).
-    A lone DeepSeek-V4-Pro outage stays ``NORMAL``: the Router escalates the routine
-    flow to GPT-5.6 Sol until Pro recovers.
+    The model mapping preserves the narrowest safe degradation while still failing
+    closed for an unavailable hot path, multiple model outages, an unknown model, or
+    an aggregated OpenAI provider outage.
     """
 
     FLASH = "deepseek-v4-flash"
-    PRO = "deepseek-v4-pro"
-    GPT = "gpt-5.6-sol"
+    LUNA = "gpt-5.6-luna"
+    TERRA = "gpt-5.6-terra"
+    SOL = "gpt-5.6-sol"
+    OPENAI = "openai"
+
+    # Backwards-compatible name used by older callers and tests.
+    GPT = SOL
+
+    KNOWN_MODELS = frozenset((FLASH, LUNA, TERRA, SOL))
+    OPENAI_MODELS = frozenset((LUNA, TERRA, SOL))
 
     def __init__(self, max_consecutive_failures: int = 2, cooldown_s: float = 300.0) -> None:
         self._max = max_consecutive_failures
         self._cooldown = cooldown_s
         self._breakers: dict[str, CircuitBreaker] = {}
+        self._provider_breakers: dict[str, CircuitBreaker] = {}
 
     def breaker(self, model: str) -> CircuitBreaker:
         return self._breakers.setdefault(model, CircuitBreaker(self._max, self._cooldown))
+
+    def provider_breaker(self, provider: str) -> CircuitBreaker:
+        provider = self.normalize_provider(provider)
+        return self._provider_breakers.setdefault(
+            provider,
+            CircuitBreaker(self._max, self._cooldown),
+        )
+
+    @staticmethod
+    def normalize_provider(provider: str) -> str:
+        return provider.strip().lower()
+
+    @classmethod
+    def infer_provider(cls, model: str) -> str | None:
+        if model in cls.OPENAI_MODELS or model.startswith("gpt-"):
+            return cls.OPENAI
+        if model == cls.FLASH or model.startswith("deepseek-"):
+            return "deepseek"
+        return None
 
     def record_failure(self, model: str, *, now: float | None = None) -> BreakerState:
         return self.breaker(model).record_failure(now=now)
@@ -101,18 +126,37 @@ class CircuitBreakerRegistry:
     def record_success(self, model: str) -> BreakerState:
         return self.breaker(model).record_success()
 
+    def record_provider_failure(
+        self,
+        provider: str,
+        *,
+        now: float | None = None,
+    ) -> BreakerState:
+        return self.provider_breaker(provider).record_failure(now=now)
+
+    def record_provider_success(self, provider: str) -> BreakerState:
+        return self.provider_breaker(provider).record_success()
+
     def is_down(self, model: str) -> bool:
         return not self.breaker(model).llm_allowed
 
+    def is_provider_down(self, provider: str) -> bool:
+        return not self.provider_breaker(provider).llm_allowed
+
     @property
     def system_mode(self) -> SystemMode:
-        flash_down = self.is_down(self.FLASH)
-        pro_down = self.is_down(self.PRO)
-        gpt_down = self.is_down(self.GPT)
-        if sum((flash_down, pro_down, gpt_down)) >= 2:
+        if self.is_provider_down(self.OPENAI):
             return SystemMode.LOCAL_QUANT_MODE
-        if gpt_down:
+
+        down_models = {model for model, breaker in self._breakers.items() if not breaker.llm_allowed}
+        if len(down_models) >= 2 or self.LUNA in down_models:
+            return SystemMode.LOCAL_QUANT_MODE
+        if down_models & {self.TERRA, self.SOL}:
             return SystemMode.CONFLICT_SAFE
-        if flash_down:
+        if self.FLASH in down_models:
             return SystemMode.TEXT_LOCAL_FILTER
+        if down_models - self.KNOWN_MODELS:
+            # A newly introduced or misspelled model must not silently bypass risk
+            # degradation merely because this package does not know its role yet.
+            return SystemMode.LOCAL_QUANT_MODE
         return SystemMode.NORMAL
