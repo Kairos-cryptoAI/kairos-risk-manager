@@ -1,7 +1,9 @@
 """Risk limits (env prefix ``KAIROS_``)."""
+
 from __future__ import annotations
 
 from kairos_core.config import CoreSettings
+from pydantic import Field
 
 
 class RiskSettings(CoreSettings):
@@ -17,13 +19,14 @@ class RiskSettings(CoreSettings):
     max_daily_drawdown_pct: float = 3.0
 
     # Position sizing.
-    per_trade_risk_fraction: float = 0.02   # fraction of equity risked per entry
+    per_trade_risk_fraction: float = 0.02  # fraction of equity risked per entry
     max_position_notional_usd: float = 250_000.0
-    min_notional_usd: float = 5.0           # EVEDEX minimum notional
+    min_notional_usd: float = 5.0  # EVEDEX minimum notional
     require_reconciled_account: bool = True
+    account_snapshot_max_age_s: float = Field(default=60.0, gt=0)
     require_strategic_allocation: bool = True
     strategic_allocation_max_age_s: float = 26 * 60 * 60
 
     # Circuit breaker.
-    breaker_max_consecutive_failures: int = 2   # trips when exceeded (i.e. on the 3rd)
-    breaker_cooldown_s: float = 300.0           # 5 minutes in LOCAL_QUANT_MODE
+    breaker_max_consecutive_failures: int = 2  # trips when exceeded (i.e. on the 3rd)
+    breaker_cooldown_s: float = 300.0  # 5 minutes in LOCAL_QUANT_MODE

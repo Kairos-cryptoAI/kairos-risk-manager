@@ -1,4 +1,5 @@
 """Deterministic position sizing — never delegated to the LLM."""
+
 from __future__ import annotations
 
 
