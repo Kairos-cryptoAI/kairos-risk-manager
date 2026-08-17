@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from uuid import NAMESPACE_URL, uuid5
 
 from kairos_core.contracts import OrderIntent, StrategicAllocation, TacticalCommand, ValidatedOrder
@@ -23,6 +24,10 @@ _NEW_RISK_REASONS = {
     ReasonCode.ENTER_SHORT_TREND,
     ReasonCode.REBALANCE,
 }
+_EXPECTED_ENTRY_SIDE = {
+    ReasonCode.ENTER_LONG_TREND: Side.LONG,
+    ReasonCode.ENTER_SHORT_TREND: Side.SHORT,
+}
 
 
 class RiskPipeline:
@@ -42,10 +47,26 @@ class RiskPipeline:
         adjustments: list[str] = []
         reason = command.reason_code
 
+        if not math.isfinite(price) or price <= 0:
+            adjustments.append("finite positive reference price required")
+            return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+
         # 1) LOCAL_QUANT_MODE permits protective actions only. Less severe modes
         # keep their narrower architecture-specific behavior in upstream layers.
         if system_mode is SystemMode.LOCAL_QUANT_MODE and reason in _NEW_RISK_REASONS:
             adjustments.append("LOCAL_QUANT_MODE blocks new risk")
+            return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+
+        expected_side = _EXPECTED_ENTRY_SIDE.get(reason)
+        if expected_side is not None and command.target_side is not expected_side:
+            adjustments.append(
+                f"{reason.value} requires target_side={expected_side.value}, "
+                f"received {command.target_side.value}"
+            )
+            return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+
+        if reason in _NEW_RISK_REASONS and not account.gross_exposure_known:
+            adjustments.append("authoritative gross exposure is unavailable")
             return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
 
         # 2) Hard veto: drawdown gate forces NO_TRADE on any new entry.
@@ -98,10 +119,26 @@ class RiskPipeline:
                 if side is None:
                     adjustments.append("rebalance requires LONG or SHORT target_side")
                     return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+            if account.open_position_qty != 0:
+                position_side = Side.LONG if account.open_position_qty > 0 else Side.SHORT
+                if command.target_side is not position_side:
+                    adjustments.append(
+                        "entry target opposes the open position; close it before changing direction"
+                    )
+                    return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
+                if not account.open_position_notional_known:
+                    adjustments.append("command-symbol position notional is unavailable")
+                    return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
             sizing_equity = strategic.available_equity_usd if strategic is not None else account.equity_usd
-            max_notional = s.max_position_notional_usd
+            max_notional = max(
+                0.0,
+                s.max_position_notional_usd - account.open_position_notional_usd,
+            )
             if strategic is not None:
                 max_notional = min(max_notional, strategic.remaining_gross_notional_usd)
+            if max_notional <= 0:
+                adjustments.append("position or strategic gross-notional cap exhausted")
+                return self._refuse(command, ReasonCode.NO_TRADE, adjustments, account)
             qty = position_quantity(
                 equity_usd=sizing_equity,
                 price=price,

@@ -21,7 +21,7 @@ from .account import AccountState
 from .circuit_breaker import CircuitBreakerRegistry
 from .config import RiskSettings
 from .pipeline import RiskPipeline
-from .strategy import is_fresh
+from .strategy import allocation_error, is_fresh
 
 log = get_logger("risk")
 
@@ -57,6 +57,7 @@ class RiskService:
         self.account_snapshot: AccountSnapshot | None = None
         self._latest_account_captured_at: datetime | None = None
         self.strategic_allocation: StrategicAllocation | None = None
+        self._latest_allocation_produced_at: datetime | None = None
         self._last_mode = SystemMode.NORMAL
 
     async def _broadcast_mode(self) -> None:
@@ -285,6 +286,32 @@ class RiskService:
                     exchange=snapshot.exchange,
                     detail=snapshot.reconciliation_detail,
                 )
+            elif snapshot.reconciled and self.account_snapshot is not None:
+                current_payload = self.account_snapshot.model_dump(
+                    exclude={
+                        "message_id",
+                        "produced_at",
+                        "correlation_id",
+                        "causation_id",
+                        "reconciliation_detail",
+                    }
+                )
+                incoming_payload = snapshot.model_dump(
+                    exclude={
+                        "message_id",
+                        "produced_at",
+                        "correlation_id",
+                        "causation_id",
+                        "reconciliation_detail",
+                    }
+                )
+                if incoming_payload != current_payload:
+                    self.account_snapshot = None
+                    log.warning(
+                        "risk.conflicting_account_snapshot_version",
+                        exchange=snapshot.exchange,
+                        captured_at=snapshot.captured_at.isoformat(),
+                    )
             return
 
         if not snapshot.reconciled:
@@ -304,14 +331,24 @@ class RiskService:
             if position.exchange != snapshot.exchange or position.account_id != snapshot.account_id
         ]
         if mismatched_positions:
+            self._latest_account_captured_at = snapshot.captured_at
+            self.account_snapshot = None
             raise ValueError(
                 "account snapshot contains positions for a different exchange/account: "
                 + ", ".join(mismatched_positions)
             )
 
+        try:
+            account = AccountState.from_snapshot(snapshot)
+        except (ArithmeticError, ValueError):
+            # Poison this event-time version so a delayed snapshot between the
+            # previous good version and this invalid newer one cannot reopen risk.
+            self._latest_account_captured_at = snapshot.captured_at
+            self.account_snapshot = None
+            raise
         self._latest_account_captured_at = snapshot.captured_at
         self.account_snapshot = snapshot
-        self.account = AccountState.from_snapshot(snapshot)
+        self.account = account
         log.info(
             "risk.account_reconciled",
             equity=snapshot.equity_usd,
@@ -323,12 +360,67 @@ class RiskService:
         async for env in self.bus.subscribe(Topics.ACCOUNT_SNAPSHOT, group="risk", consumer="account"):
             try:
                 self._handle_account(env)
+            except Exception:
+                # A malformed account event is itself loss of authoritative state.
+                # Keep it pending for diagnosis/retry, but never keep trading from an
+                # older snapshot after the boundary has observed invalid account data.
+                self.account_snapshot = None
+                log.exception("risk.account_processing_failed", envelope_id=env.id)
+                continue
+            try:
                 await self.bus.ack(Topics.ACCOUNT_SNAPSHOT, env, group="risk")
             except Exception:
-                log.exception("risk.account_processing_failed", envelope_id=env.id)
+                # The applied snapshot remains authoritative. Its stable event-time
+                # version makes the pending redelivery idempotent.
+                log.exception("risk.account_ack_failed", envelope_id=env.id)
 
     def _handle_allocation(self, env: BusEnvelope) -> None:
         allocation = StrategicAllocation.model_validate(env.payload)
+        produced_at = allocation.produced_at
+        if produced_at.utcoffset() is None:
+            self.strategic_allocation = None
+            raise ValueError("strategic allocation produced_at must be timezone-aware")
+
+        latest = self._latest_allocation_produced_at
+        if latest is not None and produced_at < latest:
+            log.warning(
+                "risk.out_of_order_allocation",
+                produced_at=produced_at.isoformat(),
+            )
+            return
+
+        invalid = allocation_error(allocation)
+        if invalid is not None:
+            if latest is None or produced_at > latest:
+                self._latest_allocation_produced_at = produced_at
+            self.strategic_allocation = None
+            raise ValueError(invalid)
+
+        if latest is not None and produced_at == latest:
+            current = self.strategic_allocation
+            if current is None:
+                return
+            current_policy = (
+                current.regime,
+                current.stable_reserve_pct,
+                tuple(sorted(current.strategy_weights.items())),
+                current.max_gross_leverage,
+            )
+            incoming_policy = (
+                allocation.regime,
+                allocation.stable_reserve_pct,
+                tuple(sorted(allocation.strategy_weights.items())),
+                allocation.max_gross_leverage,
+            )
+            if incoming_policy != current_policy:
+                self.strategic_allocation = None
+                log.warning(
+                    "risk.conflicting_allocation_version",
+                    produced_at=produced_at.isoformat(),
+                )
+            return
+
+        self._latest_allocation_produced_at = produced_at
         self.strategic_allocation = allocation
         log.info(
             "risk.allocation_updated",
@@ -346,9 +438,14 @@ class RiskService:
         ):
             try:
                 self._handle_allocation(env)
+            except Exception:
+                self.strategic_allocation = None
+                log.exception("risk.allocation_processing_failed", envelope_id=env.id)
+                continue
+            try:
                 await self.bus.ack(Topics.STRATEGIC_ALLOCATION, env, group="risk")
             except Exception:
-                log.exception("risk.allocation_processing_failed", envelope_id=env.id)
+                log.exception("risk.allocation_ack_failed", envelope_id=env.id)
 
     async def close(self) -> None:
         await self.bus.close()

@@ -29,6 +29,16 @@ def test_drawdown_gate_allows_exits():
     assert drawdown_gate(ReasonCode.CLOSE_POSITION, acc, S) is None
 
 
+def test_drawdown_boundary_is_fail_closed_for_entries():
+    acc = AccountState(equity_usd=9700, peak_equity_usd=10000, daily_pnl_pct=0)
+    assert drawdown_gate(ReasonCode.ENTER_LONG_TREND, acc, S)
+
+
+def test_drawdown_just_below_boundary_allows_entry():
+    acc = AccountState(equity_usd=9700.01, peak_equity_usd=10000, daily_pnl_pct=0)
+    assert drawdown_gate(ReasonCode.ENTER_LONG_TREND, acc, S) is None
+
+
 def test_min_notional_zeroes_dust():
     qty, note = enforce_min_notional(0.00001, 1.0, S)
     assert qty == 0.0 and note

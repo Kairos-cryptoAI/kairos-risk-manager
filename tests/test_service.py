@@ -9,9 +9,17 @@ from kairos_core.contracts import (
     AccountSnapshot,
     LLMHealthEvent,
     PositionSnapshot,
+    StrategicAllocation,
     TacticalCommand,
 )
-from kairos_core.enums import ReasonCode, Side, SystemMode, TacticalStatus
+from kairos_core.enums import (
+    MarketRegime,
+    ReasonCode,
+    Side,
+    StrategicTrigger,
+    SystemMode,
+    TacticalStatus,
+)
 from kairos_core.topics import Topics
 
 from kairos_risk.circuit_breaker import CircuitBreakerRegistry
@@ -25,9 +33,11 @@ class FakeBus:
         envelopes: dict[str, list[BusEnvelope]] | None = None,
         *,
         fail_publish_topic: str | None = None,
+        fail_ack_topic: str | None = None,
     ) -> None:
         self.envelopes = envelopes or {}
         self.fail_publish_topic = fail_publish_topic
+        self.fail_ack_topic = fail_ack_topic
         self.published: list[tuple[str, object]] = []
         self.acks: list[tuple[str, str]] = []
         self.events: list[tuple[str, str]] = []
@@ -46,6 +56,8 @@ class FakeBus:
 
     async def ack(self, topic, envelope, **kwargs) -> None:
         self.events.append(("ack", topic))
+        if topic == self.fail_ack_topic:
+            raise RuntimeError("bus ack failed")
         self.acks.append((topic, envelope.id))
 
     async def close(self) -> None:
@@ -129,6 +141,18 @@ def _snapshot(
         captured_at=capture_time,
         reconciled=reconciled,
         reconciliation_detail=reconciliation_detail,
+    )
+
+
+def _allocation(*, produced_at: datetime, regime: MarketRegime = MarketRegime.BULL):
+    return StrategicAllocation(
+        source="macro",
+        regime=regime,
+        stable_reserve_pct=0.2,
+        strategy_weights={"trend": 0.8},
+        max_gross_leverage=2,
+        triggered_by=StrategicTrigger.SCHEDULE,
+        produced_at=produced_at,
     )
 
 
@@ -501,6 +525,28 @@ async def test_same_version_failure_dominates_reconciled_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_conflicting_reconciled_snapshot_version_revokes_authority():
+    captured_at = datetime.now(UTC)
+    first = _snapshot(captured_at=captured_at)
+    conflict = first.model_copy(update={"equity_usd": first.equity_usd - 100})
+    bus = FakeBus(
+        {
+            Topics.ACCOUNT_SNAPSHOT: [
+                _envelope(Topics.ACCOUNT_SNAPSHOT, first, envelope_id="first"),
+                _envelope(Topics.ACCOUNT_SNAPSHOT, conflict, envelope_id="conflict"),
+            ]
+        }
+    )
+    service = _service(require_reconciled_account=True)
+    service.bus = bus
+
+    await service._consume_account()
+
+    assert service.account_snapshot is None
+    assert len(bus.acks) == 2
+
+
+@pytest.mark.asyncio
 async def test_older_unreconciled_snapshot_cannot_revoke_newer_state():
     now = datetime.now(UTC)
     current = _snapshot(captured_at=now)
@@ -556,6 +602,120 @@ async def test_inconsistent_position_identity_leaves_snapshot_pending():
     await service._consume_account()
 
     assert service.account_snapshot is None
+    assert bus.acks == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_newer_snapshot_revokes_previous_authority():
+    now = datetime.now(UTC)
+    good = _snapshot(captured_at=now - timedelta(seconds=1))
+    invalid = _snapshot(captured_at=now).model_copy(update={"peak_equity_usd": 10_000})
+    delayed = _snapshot(captured_at=now - timedelta(milliseconds=500))
+    bus = FakeBus(
+        {
+            Topics.ACCOUNT_SNAPSHOT: [
+                _envelope(Topics.ACCOUNT_SNAPSHOT, good, envelope_id="good"),
+                _envelope(Topics.ACCOUNT_SNAPSHOT, invalid, envelope_id="invalid"),
+                _envelope(Topics.ACCOUNT_SNAPSHOT, delayed, envelope_id="delayed"),
+            ]
+        }
+    )
+    service = _service(require_reconciled_account=True)
+    service.bus = bus
+
+    await service._consume_account()
+
+    assert service.account_snapshot is None
+    assert service._latest_account_captured_at == now
+    assert bus.acks == [
+        (Topics.ACCOUNT_SNAPSHOT, "good"),
+        (Topics.ACCOUNT_SNAPSHOT, "delayed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_account_ack_failure_keeps_applied_authority_for_redelivery():
+    snapshot = _snapshot()
+    bus = FakeBus(
+        {Topics.ACCOUNT_SNAPSHOT: [_envelope(Topics.ACCOUNT_SNAPSHOT, snapshot)]},
+        fail_ack_topic=Topics.ACCOUNT_SNAPSHOT,
+    )
+    service = _service(require_reconciled_account=True)
+    service.bus = bus
+
+    await service._consume_account()
+
+    assert service.account_snapshot == snapshot
+    assert bus.acks == []
+
+
+@pytest.mark.asyncio
+async def test_unpriced_position_blocks_entry_but_still_allows_exact_exit():
+    snapshot = _snapshot()
+    unpriced = snapshot.positions[0].model_copy(update={"entry_price": None, "mark_price": None})
+    snapshot = snapshot.model_copy(update={"positions": [unpriced]})
+    service = _service(require_reconciled_account=True)
+    service._handle_account(_envelope(Topics.ACCOUNT_SNAPSHOT, snapshot))
+    entry = _command()
+    close = _command(reason=ReasonCode.CLOSE_POSITION)
+    bus = FakeBus(
+        {
+            Topics.TACTICAL_COMMAND: [
+                _envelope(Topics.TACTICAL_COMMAND, entry, envelope_id="entry"),
+                _envelope(Topics.TACTICAL_COMMAND, close, envelope_id="close"),
+            ]
+        }
+    )
+    service.bus = bus
+
+    await service._consume_commands()
+
+    entry_result = bus.published[0][1]
+    close_result = bus.published[1][1]
+    assert entry_result.approved is False
+    assert any("gross exposure" in note for note in entry_result.adjustments)
+    assert close_result.approved is True
+    assert close_result.intent.quantity == 0.2
+    assert close_result.intent.reduce_only is True
+
+
+def test_older_allocation_cannot_roll_back_current_policy():
+    now = datetime.now(UTC)
+    service = _service()
+    current = _allocation(produced_at=now, regime=MarketRegime.BEAR)
+    older = _allocation(produced_at=now - timedelta(seconds=1), regime=MarketRegime.BULL)
+
+    service._handle_allocation(_envelope(Topics.STRATEGIC_ALLOCATION, current))
+    service._handle_allocation(_envelope(Topics.STRATEGIC_ALLOCATION, older))
+
+    assert service.strategic_allocation == current
+
+
+def test_conflicting_allocation_at_same_event_time_revokes_policy():
+    now = datetime.now(UTC)
+    service = _service()
+    first = _allocation(produced_at=now, regime=MarketRegime.BULL)
+    conflict = _allocation(produced_at=now, regime=MarketRegime.BEAR)
+
+    service._handle_allocation(_envelope(Topics.STRATEGIC_ALLOCATION, first))
+    service._handle_allocation(_envelope(Topics.STRATEGIC_ALLOCATION, conflict))
+
+    assert service.strategic_allocation is None
+
+
+@pytest.mark.asyncio
+async def test_allocation_ack_failure_keeps_applied_policy_for_redelivery():
+    allocation = _allocation(produced_at=datetime.now(UTC))
+    bus = FakeBus(
+        {Topics.STRATEGIC_ALLOCATION: [_envelope(Topics.STRATEGIC_ALLOCATION, allocation)]},
+        fail_ack_topic=Topics.STRATEGIC_ALLOCATION,
+    )
+    service = _service()
+    service.bus = bus
+
+    await service._consume_allocation()
+
+    assert service.strategic_allocation == allocation
     assert bus.acks == []
 
 

@@ -6,6 +6,8 @@ They are deliberately tiny so they can be unit-tested in isolation and audited.
 
 from __future__ import annotations
 
+import math
+
 from kairos_core.enums import ReasonCode
 
 from .account import AccountState
@@ -15,6 +17,8 @@ ENTRY_CODES = {ReasonCode.ENTER_LONG_TREND, ReasonCode.ENTER_SHORT_TREND, Reason
 
 
 def cap_leverage(requested: float, settings: RiskSettings) -> tuple[float, str | None]:
+    if not math.isfinite(requested) or requested <= 0:
+        return 0.0, "invalid leverage -> entry refused"
     if requested > settings.hard_leverage_limit:
         # Treated as a model error -> forcibly reduced to the safe cap.
         return settings.safe_leverage_cap, (
@@ -39,6 +43,8 @@ def drawdown_gate(reason_code: ReasonCode, account: AccountState, settings: Risk
 
 
 def enforce_min_notional(qty: float, price: float, settings: RiskSettings) -> tuple[float, str | None]:
+    if not math.isfinite(qty) or not math.isfinite(price) or qty <= 0 or price <= 0:
+        return 0.0, "invalid quantity or price -> zeroed"
     if qty * price < settings.min_notional_usd:
         return 0.0, f"notional below exchange minimum ${settings.min_notional_usd:g} -> zeroed"
     return qty, None

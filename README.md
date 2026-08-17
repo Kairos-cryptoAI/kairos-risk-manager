@@ -13,8 +13,15 @@ circuit breaker. This service contains no LLM and never sends exchange requests.
   safely without the authoritative signed position.
 - A newer `reconciled=false` snapshot immediately revokes the previously trusted
   account view. Older out-of-order snapshots cannot roll state back.
-- Daily drawdown, leverage, strategic allocation, exposure, and minimum-notional
-  gates are deterministic.
+- The entry drawdown gate uses the worse of reported daily loss and the decline from
+  authoritative peak equity. Equality at the configured 3% limit is fail-closed;
+  reduce-only exits bypass the entry gate.
+- Leverage settings have validated ordering, every numeric account/price/sizing input
+  must be finite, and malformed sizing inputs produce `NO_TRADE` rather than an order.
+- New risk is refused when gross exposure or an existing symbol position cannot be
+  valued. Same-direction additions consume only the remaining per-position allowance;
+  changing direction requires a reduce-only close first.
+- Strategic allocation, gross exposure, and minimum-notional gates are deterministic.
 - `LOCAL_QUANT_MODE` refuses `ENTER_LONG_TREND`, `ENTER_SHORT_TREND`, and `REBALANCE`.
   Reduce-only exits remain available. `TEXT_LOCAL_FILTER` and `CONFLICT_SAFE` retain
   their narrower upstream semantics and do not blanket-disable otherwise valid entries.
@@ -36,6 +43,21 @@ Two or more unavailable models, an unknown unavailable model, or an aggregated O
 connection/rate-limit outage selects `LOCAL_QUANT_MODE`. Successful calls recover only
 the named model and its provider aggregate. Bad output and permanent HTTP/client errors
 remain visible health failures but do not represent an availability outage.
+
+## Sizing semantics and offline policy evaluation
+
+`KAIROS_PER_TRADE_RISK_FRACTION=0.02` is an equity allocation budget which is
+multiplied by the approved leverage and capped by the per-position and strategic gross
+limits. It is **not** loss-at-stop, VaR, or a claim that only 2% can be lost: the current
+`TacticalCommand` contract has no stop distance. That distinction is intentional and
+must stay visible until stop-aware sizing is added end to end.
+
+`kairos_risk.evaluation.evaluate_policy` runs a named, deterministic, network-free
+matrix of commands, account states, system modes and allocations. It rejects duplicate
+case names and asserts that approved decisions have finite positive notional, that
+`NO_TRADE` is never approved, and that `LOCAL_QUANT_MODE` never creates new risk. The
+test suite covers the exact drawdown boundary, stale/inconsistent PnL, non-finite input,
+leverage/position caps, degraded-mode entry refusal, and protective exits.
 
 ## Required Execution account snapshot
 

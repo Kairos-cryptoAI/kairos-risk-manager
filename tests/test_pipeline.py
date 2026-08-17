@@ -2,6 +2,7 @@ from kairos_core.contracts import TacticalCommand
 from kairos_core.enums import ReasonCode, Side, SystemMode, TacticalStatus
 
 from kairos_risk.account import AccountState
+from kairos_risk.config import RiskSettings
 from kairos_risk.pipeline import RiskPipeline
 
 
@@ -126,6 +127,77 @@ def test_rebalance_uses_explicit_target_side():
     assert long.intent.side.value == "BUY"
     assert flat.approved is False
     assert flat.reason_code is ReasonCode.NO_TRADE
+
+
+def test_entry_reason_must_match_target_side():
+    pipeline = RiskPipeline()
+    account = AccountState(equity_usd=10_000, peak_equity_usd=10_000)
+    inconsistent = _cmd(reason=ReasonCode.ENTER_SHORT_TREND, lev=2.0)
+
+    result = pipeline.validate(inconsistent, account, price=65_000)
+
+    assert result.approved is False
+    assert result.reason_code is ReasonCode.NO_TRADE
+    assert any("target_side=SHORT" in note for note in result.adjustments)
+
+
+def test_unknown_gross_exposure_blocks_entry_but_not_exit():
+    pipeline = RiskPipeline()
+    account = AccountState(
+        equity_usd=10_000,
+        peak_equity_usd=10_000,
+        gross_exposure_known=False,
+        open_position_qty=0.1,
+    )
+
+    entry = pipeline.validate(_cmd(lev=2.0), account, price=65_000)
+    close = pipeline.validate(_cmd(reason=ReasonCode.CLOSE_POSITION), account, price=65_000)
+
+    assert entry.approved is False
+    assert any("gross exposure" in note for note in entry.adjustments)
+    assert close.approved is True
+    assert close.intent.reduce_only is True
+    assert close.intent.quantity == 0.1
+
+
+def test_same_direction_addition_uses_remaining_position_capacity():
+    pipeline = RiskPipeline(
+        RiskSettings(
+            max_position_notional_usd=5_000,
+            per_trade_risk_fraction=0.1,
+        )
+    )
+    account = AccountState(
+        equity_usd=10_000,
+        peak_equity_usd=10_000,
+        gross_exposure_usd=4_800,
+        open_position_qty=48,
+        open_position_notional_usd=4_800,
+        open_position_notional_known=True,
+    )
+
+    result = pipeline.validate(_cmd(lev=2.0), account, price=100)
+
+    assert result.approved is True
+    assert result.intent.quantity == 2
+    assert account.open_position_notional_usd + result.intent.quantity * 100 == 5_000
+
+
+def test_entry_cannot_implicitly_reverse_an_open_position():
+    pipeline = RiskPipeline()
+    account = AccountState(
+        equity_usd=10_000,
+        peak_equity_usd=10_000,
+        gross_exposure_usd=1_000,
+        open_position_qty=-0.1,
+        open_position_notional_usd=1_000,
+        open_position_notional_known=True,
+    )
+
+    result = pipeline.validate(_cmd(lev=2.0), account, price=10_000)
+
+    assert result.approved is False
+    assert any("close it before changing direction" in note for note in result.adjustments)
 
 
 def test_redelivered_command_produces_stable_decision_and_intent_ids():

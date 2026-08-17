@@ -1,11 +1,12 @@
 """Strategic allocation limit tests (regime forbids, exposure cap, freshness)."""
 
+import math
 from datetime import UTC, datetime, timedelta
 
 from kairos_core.contracts import StrategicAllocation
 from kairos_core.enums import MarketRegime, ReasonCode, StrategicTrigger
 
-from kairos_risk.strategy import is_fresh, limits_for
+from kairos_risk.strategy import allocation_error, is_fresh, limits_for
 
 
 def _alloc(regime=MarketRegime.BULL, stable=0.2, max_lev=2.0, age_s=0.0):
@@ -93,3 +94,24 @@ def test_fresh_allocation_within_max_age():
 def test_stale_allocation_exceeds_max_age():
     alloc = _alloc(age_s=200)
     assert is_fresh(alloc, max_age_s=120) is False
+
+
+def test_naive_allocation_timestamp_is_never_fresh():
+    allocation = _alloc().model_copy(update={"produced_at": datetime.now()})
+    assert is_fresh(allocation, max_age_s=120) is False
+    assert is_fresh(_alloc(), max_age_s=math.inf) is False
+
+
+def test_invalid_strategy_weight_fails_closed_even_for_unvalidated_instance():
+    allocation = _alloc().model_copy(update={"strategy_weights": {"trend": math.nan}})
+
+    limits = limits_for(
+        allocation,
+        reason=ReasonCode.ENTER_LONG_TREND,
+        equity_usd=10_000,
+        gross_exposure_usd=0,
+    )
+
+    assert allocation_error(allocation) is not None
+    assert limits.allowed is False
+    assert limits.available_equity_usd == 0

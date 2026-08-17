@@ -13,6 +13,7 @@ __version__ = "0.1.0"
 from .account import AccountState
 from .circuit_breaker import BreakerState, CircuitBreaker, CircuitBreakerRegistry
 from .config import RiskSettings
+from .evaluation import RiskCase, RiskEvaluation, evaluate_policy
 from .pipeline import RiskPipeline
 
 __all__ = [
@@ -21,6 +22,9 @@ __all__ = [
     "BreakerState",
     "CircuitBreakerRegistry",
     "RiskPipeline",
+    "RiskCase",
+    "RiskEvaluation",
     "RiskSettings",
+    "evaluate_policy",
     "__version__",
 ]
