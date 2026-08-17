@@ -16,6 +16,7 @@ from kairos_core.contracts.base import KairosMessage
 from kairos_core.enums import ReasonCode, SystemMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
+from kairos_persistence import DurableMessageBus
 
 from .account import AccountState
 from .circuit_breaker import CircuitBreakerRegistry
@@ -44,7 +45,12 @@ class _Control(KairosMessage):
 class RiskService:
     def __init__(self, settings: RiskSettings | None = None) -> None:
         self.settings = settings or RiskSettings()
-        self.bus = build_bus(self.settings)
+        transport = build_bus(self.settings)
+        self.bus = (
+            transport
+            if self.settings.bus_backend == "memory"
+            else DurableMessageBus(transport, service_name=self.settings.service_name)
+        )
         self.pipeline = RiskPipeline(self.settings)
         self.breakers = CircuitBreakerRegistry(
             self.settings.breaker_max_consecutive_failures,

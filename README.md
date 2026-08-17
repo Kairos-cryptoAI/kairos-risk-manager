@@ -158,4 +158,11 @@ uv lock --upgrade-package kairos-core
 uv sync --locked
 ```
 
+## Runtime delivery durability
+
+With Redis, consumed IDs, validated/refused orders and completion are committed
+through `kairos-persistence`; Redis is ACKed only after PostgreSQL commits.
+Configure `KAIROS_PERSISTENCE_DATABASE_URL` through the deployment secret
+provider. The in-memory backend intentionally bypasses persistence for tests.
+
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
