@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from datetime import UTC, datetime
 
 from kairos_core.bus import BusEnvelope, build_bus
 from kairos_core.contracts import (
     AccountSnapshot,
+    AccountSnapshotV2,
+    CandidateReviewV1,
     LLMHealthEvent,
+    RiskTradeDecisionV1,
     StrategicAllocation,
     TacticalCommand,
+    VenueQualityV1,
 )
 from kairos_core.contracts.base import KairosMessage
-from kairos_core.enums import ReasonCode, SystemMode
+from kairos_core.enums import ReasonCode, SystemMode, TradingMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableMessageBus
@@ -21,6 +27,12 @@ from kairos_persistence import DurableMessageBus
 from .account import AccountState
 from .circuit_breaker import CircuitBreakerRegistry
 from .config import RiskSettings
+from .paper import PaperRiskPipeline
+from .paper_runtime import (
+    PaperInputDeadlineExceeded,
+    PaperInputUnavailable,
+    PaperRiskCoordinator,
+)
 from .pipeline import RiskPipeline
 from .strategy import allocation_error, is_fresh
 
@@ -52,6 +64,8 @@ class RiskService:
             else DurableMessageBus(transport, service_name=self.settings.service_name)
         )
         self.pipeline = RiskPipeline(self.settings)
+        self.paper_pipeline = PaperRiskPipeline(self.settings)
+        self.paper = PaperRiskCoordinator(self.settings, self.paper_pipeline)
         self.breakers = CircuitBreakerRegistry(
             self.settings.breaker_max_consecutive_failures,
             self.settings.breaker_cooldown_s,
@@ -65,6 +79,10 @@ class RiskService:
         self.strategic_allocation: StrategicAllocation | None = None
         self._latest_allocation_produced_at: datetime | None = None
         self._last_mode = SystemMode.NORMAL
+
+    @staticmethod
+    def _now_ms() -> int:
+        return time.time_ns() // 1_000_000
 
     async def _broadcast_mode(self) -> None:
         mode = self.breakers.system_mode
@@ -237,6 +255,85 @@ class RiskService:
                 await self.bus.ack(Topics.TACTICAL_COMMAND, env, group="risk")
             except Exception:
                 log.exception("risk.command_processing_failed", envelope_id=env.id)
+
+    async def _handle_paper_review(self, env: BusEnvelope) -> None:
+        review = CandidateReviewV1.model_validate(env.payload)
+        while True:
+            await self.paper.wait_for_inputs(review, now_ms=self._now_ms)
+            try:
+                decision = await self.paper.evaluate(
+                    review,
+                    allocation=self.strategic_allocation,
+                    decided_at_ms=self._now_ms(),
+                    system_mode=self.breakers.system_mode,
+                )
+                break
+            except PaperInputUnavailable:
+                # A same-tick account/venue conflict can revoke authority after
+                # wait_for_inputs returned. Re-enter the bounded condition wait.
+                continue
+        await self.bus.publish(Topics.RISK_TRADE_DECISION, decision)
+        log.info(
+            "risk.paper_decision",
+            intent_id=review.intent.intent_id,
+            symbol=review.intent.symbol,
+            approved=decision.approved,
+            rejection_reasons=decision.rejection_reasons,
+            quantity=decision.quantity,
+            worst_case_loss_usd=decision.worst_case_loss_usd,
+        )
+
+    async def _consume_paper_reviews(self) -> None:
+        async for env in self.bus.subscribe(
+            Topics.CANDIDATE_REVIEW,
+            group="risk-paper",
+            consumer="candidate-reviews",
+        ):
+            try:
+                await self._handle_paper_review(env)
+                await self.bus.ack(Topics.CANDIDATE_REVIEW, env, group="risk-paper")
+            except PaperInputUnavailable:
+                log.warning("risk.paper_input_unavailable", envelope_id=env.id)
+            except PaperInputDeadlineExceeded:
+                # VenueQuality is required by the strict output contract, so no
+                # synthetic rejection may be invented when it never arrives.
+                # Complete this terminal safe-drop before Redis's 3-minute reclaim.
+                log.warning("risk.paper_input_deadline", envelope_id=env.id)
+                await self.bus.ack(Topics.CANDIDATE_REVIEW, env, group="risk-paper")
+            except Exception:
+                log.exception("risk.paper_review_processing_failed", envelope_id=env.id)
+
+    async def _handle_paper_venue(self, env: BusEnvelope) -> None:
+        venue = VenueQualityV1.model_validate(env.payload)
+        await self.paper.apply_venue(venue)
+
+    async def _consume_paper_venue(self) -> None:
+        async for env in self.bus.subscribe(
+            Topics.VENUE_QUALITY,
+            group="risk-paper",
+            consumer="venue-quality",
+        ):
+            try:
+                await self._handle_paper_venue(env)
+                await self.bus.ack(Topics.VENUE_QUALITY, env, group="risk-paper")
+            except Exception:
+                log.exception("risk.paper_venue_processing_failed", envelope_id=env.id)
+
+    async def _handle_paper_account(self, env: BusEnvelope) -> None:
+        snapshot = AccountSnapshotV2.model_validate(env.payload)
+        await self.paper.apply_account(snapshot)
+
+    async def _consume_paper_account(self) -> None:
+        async for env in self.bus.subscribe(
+            Topics.ACCOUNT_SNAPSHOT_V2,
+            group="risk-paper",
+            consumer="account-v2",
+        ):
+            try:
+                await self._handle_paper_account(env)
+                await self.bus.ack(Topics.ACCOUNT_SNAPSHOT_V2, env, group="risk-paper")
+            except Exception:
+                log.exception("risk.paper_account_processing_failed", envelope_id=env.id)
 
     async def _handle_health(self, env: BusEnvelope) -> None:
         event = LLMHealthEvent.model_validate(env.payload)
@@ -456,6 +553,39 @@ class RiskService:
     async def close(self) -> None:
         await self.bus.close()
 
+    async def _recover_paper_state(self) -> None:
+        """Restore committed approvals before subscribing to any PAPER review."""
+
+        if not isinstance(self.bus, DurableMessageBus):
+            raise RuntimeError("PAPER recovery requires DurableMessageBus")
+        await self.bus.start()
+        recovered_at_ms = self._now_ms()
+        rows = await self.bus.database.pool.fetch(
+            """SELECT payload FROM event_audit
+               WHERE topic=$1
+                 AND payload->>'approved'='true'
+                 AND payload->>'trading_mode'='PAPER'
+                 AND payload->>'evedex_profile'='DEV'
+                 AND payload->>'account_id'=$2
+                 AND (payload->'intent'->>'entry_expires_ts_ms')::bigint >= $3
+               ORDER BY produced_at, message_id""",
+            Topics.RISK_TRADE_DECISION,
+            self.settings.paper_account_id,
+            recovered_at_ms,
+        )
+        decisions = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            decisions.append(RiskTradeDecisionV1.model_validate(payload))
+        await self.paper.restore_reservations(decisions)
+        log.info(
+            "risk.paper_recovery_loaded",
+            reservations=len(decisions),
+            account_id=self.settings.paper_account_id,
+        )
+
     async def run(self) -> None:
         try:
             configure_logging(
@@ -463,12 +593,19 @@ class RiskService:
                 json_logs=self.settings.log_json,
                 service=self.settings.service_name,
             )
+            if self.settings.trading_mode is TradingMode.PAPER:
+                await self._recover_paper_state()
             log.info("risk.start")
             async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(self._consume_commands(), name="tactical-commands")
                 tasks.create_task(self._consume_health(), name="llm-health")
-                tasks.create_task(self._consume_account(), name="account-snapshots")
                 tasks.create_task(self._consume_allocation(), name="strategic-allocation")
+                if self.settings.trading_mode is TradingMode.DRY_RUN:
+                    tasks.create_task(self._consume_commands(), name="tactical-commands")
+                    tasks.create_task(self._consume_account(), name="account-snapshots")
+                elif self.settings.trading_mode is TradingMode.PAPER:
+                    tasks.create_task(self._consume_paper_reviews(), name="paper-reviews")
+                    tasks.create_task(self._consume_paper_venue(), name="paper-venue-quality")
+                    tasks.create_task(self._consume_paper_account(), name="paper-account-v2")
         finally:
             await self.close()
 

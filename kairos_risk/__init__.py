@@ -8,12 +8,14 @@ the account.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .account import AccountState
 from .circuit_breaker import BreakerState, CircuitBreaker, CircuitBreakerRegistry
 from .config import RiskSettings
 from .evaluation import RiskCase, RiskEvaluation, evaluate_policy
+from .paper import PaperReservations, PaperRiskPipeline
+from .paper_runtime import PaperInputDeadlineExceeded, PaperInputUnavailable, PaperRiskCoordinator
 from .pipeline import RiskPipeline
 
 __all__ = [
@@ -22,6 +24,11 @@ __all__ = [
     "BreakerState",
     "CircuitBreakerRegistry",
     "RiskPipeline",
+    "PaperRiskPipeline",
+    "PaperReservations",
+    "PaperRiskCoordinator",
+    "PaperInputUnavailable",
+    "PaperInputDeadlineExceeded",
     "RiskCase",
     "RiskEvaluation",
     "RiskSettings",
