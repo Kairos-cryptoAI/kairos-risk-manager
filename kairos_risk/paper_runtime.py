@@ -201,6 +201,7 @@ class PaperRiskCoordinator:
         allocation: StrategicAllocation | None,
         decided_at_ms: int,
         system_mode: SystemMode,
+        admission_rejection_reasons: tuple[str, ...] = (),
     ) -> RiskTradeDecisionV1:
         """Serialize evaluation and reserve an approved symbol before publish."""
 
@@ -211,7 +212,7 @@ class PaperRiskCoordinator:
             if not self.recovery_complete:
                 raise PaperInputUnavailable("PAPER durable/account recovery is incomplete")
             cached = self._decisions.get(review_id)
-            if cached is not None:
+            if cached is not None and not admission_rejection_reasons:
                 self._decisions.move_to_end(review_id)
                 return cached
             expected_symbol = PAPER_DEV_SYMBOL_MAP.get(review.intent.symbol)
@@ -228,7 +229,14 @@ class PaperRiskCoordinator:
                 decided_at_ms=decided_at_ms,
                 system_mode=system_mode,
                 reservations=reservation_snapshot,
+                admission_rejection_reasons=admission_rejection_reasons,
             )
+            if admission_rejection_reasons:
+                # Admission authority is external to the decision cache.  A direct-bus
+                # canary must never reuse an earlier approved cache entry after its
+                # single-use durable arm is absent, and an unauthorized rejection must
+                # not poison a later legitimate same-inbox recovery.
+                return decision
             self._decisions[review_id] = decision
             self._decisions.move_to_end(review_id)
             if decision.approved:

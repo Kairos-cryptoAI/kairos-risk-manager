@@ -34,8 +34,10 @@ from kairos_core.enums import (
     TradingMode,
 )
 
+from kairos_risk.canary import CanaryPlan, prepare_canary
 from kairos_risk.config import PAPER_DEV_SYMBOL_MAP, RiskSettings
 from kairos_risk.paper import PaperReservations, PaperRiskPipeline
+from tests.test_canary import _inputs as _canary_inputs
 
 T0 = 1_800_000_000_000
 NOW = T0 + 60_400
@@ -48,7 +50,7 @@ SHA_D = "d" * 64
 def _settings(**overrides: object) -> RiskSettings:
     values: dict[str, object] = {
         "trading_mode": TradingMode.PAPER,
-        "paper_strategy_allowlist": ["technical-canary@1"],
+        "paper_strategy_allowlist": ["paper-test-strategy@1", "technical-canary@1"],
         "paper_account_id": "kairos-paper-dev-01",
     }
     values.update(overrides)
@@ -58,7 +60,7 @@ def _settings(**overrides: object) -> RiskSettings:
 def _intent(**overrides: object) -> StrategyIntentV1:
     values: dict[str, object] = {
         "source": "strategy-engine",
-        "strategy_id": "technical-canary",
+        "strategy_id": "paper-test-strategy",
         "strategy_revision": "1",
         "symbol": "BTCUSDT",
         "side": Side.LONG,
@@ -174,7 +176,7 @@ def _position(**overrides: object) -> PositionSnapshotV2:
         "entry_price": 100.0,
         "mark_price": 100.0,
         "leverage": 1.0,
-        "strategy_id": "technical-canary",
+        "strategy_id": "paper-test-strategy",
         "strategy_revision": "1",
         "intent_id": SHA_A,
         "risk_decision_id": SHA_B,
@@ -193,7 +195,7 @@ def _position(**overrides: object) -> PositionSnapshotV2:
 
 def _allocation(
     *,
-    strategy_id: str = "technical-canary",
+    strategy_id: str = "paper-test-strategy",
     produced_at: datetime | None = None,
     regime: MarketRegime = MarketRegime.BULL,
     strategy_weight: float = 0.8,
@@ -255,6 +257,34 @@ def test_approved_quantity_is_exact_loss_at_stop_budget() -> None:
     assert decision.account_id == "kairos-paper-dev-01"
     assert decision.trade_id is not None
     assert decision.decision_id == decision.message_id
+
+
+def test_technical_canary_uses_exact_venue_minimum_or_rejects_capacity() -> None:
+    prepared = prepare_canary(
+        CanaryPlan(symbol="BTCUSDT", side=Side.LONG),
+        _canary_inputs(),
+        account_id="kairos-paper-dev-01",
+        now_ms=NOW,
+        account_max_age_ms=30_000,
+        allocation_max_age_s=1_000,
+    )
+    approved = _evaluate(
+        review=prepared.review,
+        allocation=prepared.allocation,
+    )
+    blocked = _evaluate(
+        review=prepared.review,
+        allocation=prepared.allocation,
+        settings=_settings(paper_max_position_notional_usd=5.0),
+    )
+
+    assert approved.approved
+    assert approved.quantity == pytest.approx(0.05)
+    assert approved.leverage == 1.0
+    assert approved.worst_case_loss_usd <= approved.loss_budget_usd
+    assert not blocked.approved
+    assert "canary_minimum_exceeds_risk_capacity" in blocked.rejection_reasons
+    assert blocked.quantity == 0
 
 
 def test_short_uses_bid_sell_slippage_and_identical_risk_formula() -> None:
@@ -379,8 +409,24 @@ def test_other_symbol_reservation_counts_toward_portfolio_risk_and_notional() ->
 
 
 def test_technical_canary_has_one_global_idea_across_all_symbols_and_states() -> None:
+    prepared = prepare_canary(
+        CanaryPlan(symbol="BTCUSDT", side=Side.LONG),
+        _canary_inputs(),
+        account_id="kairos-paper-dev-01",
+        now_ms=NOW,
+        account_max_age_ms=30_000,
+        allocation_max_age_s=1_000,
+    )
+    canary_inputs = {
+        "review": prepared.review,
+        "allocation": prepared.allocation,
+    }
     existing_position = _evaluate(
-        account=_account(positions=(_position(),), total_open_risk_usd=0.5),
+        account=_account(
+            positions=(_position(strategy_id="technical-canary"),),
+            total_open_risk_usd=0.5,
+        ),
+        **canary_inputs,
     )
     existing_entry_order = OpenOrderSnapshotV2(
         venue_symbol="ETHUSD:DEV",
@@ -401,14 +447,18 @@ def test_technical_canary_has_one_global_idea_across_all_symbols_and_states() ->
         created_at_ms=T0 + 60_000,
         updated_at_ms=T0 + 60_100,
     )
-    pending_entry = _evaluate(account=_account(open_orders=(existing_entry_order,)))
+    pending_entry = _evaluate(
+        account=_account(open_orders=(existing_entry_order,)),
+        **canary_inputs,
+    )
     fully_filled_payload = existing_entry_order.model_dump()
     fully_filled_payload.update(
         filled_quantity=existing_entry_order.quantity,
         status=OrderStatus.PARTIALLY_FILLED,
     )
     still_open_after_reported_fill = _evaluate(
-        account=_account(open_orders=(OpenOrderSnapshotV2(**fully_filled_payload),))
+        account=_account(open_orders=(OpenOrderSnapshotV2(**fully_filled_payload),)),
+        **canary_inputs,
     )
     recovered_or_in_flight = _evaluate(
         reservations=PaperReservations(
@@ -417,7 +467,8 @@ def test_technical_canary_has_one_global_idea_across_all_symbols_and_states() ->
             notional_usd=100.0,
             strategy_notional_usd=(("technical-canary", 100.0),),
             active_canary_ideas=1,
-        )
+        ),
+        **canary_inputs,
     )
 
     assert not existing_position.approved

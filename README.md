@@ -139,6 +139,61 @@ Defaults are at most 0.25% equity loss budget per trade and 1% total open risk. 
 settings reject configuration above either ceiling. The current canary default is 1x;
 leverage can only constrain notional and never multiplies risk budget.
 
+## Manually armed technical canary
+
+`kairos-paper-canary` is the only pre-alpha candidate source intended for the
+technical EVEDEX DEV canary. It has no authenticated/mutation exchange client,
+secret access, LLM, or news-feed dependency. It reads the latest closed Binance bar, fresh EVEDEX DEV
+`VenueQualityV1`, authoritative `AccountSnapshotV2`, current Macro allocation when
+present, and unfinished canary reservations from durable `event_audit`. It also
+reads the exact instrument rule from the fixed public EVEDEX DEV endpoint; the
+canonical rule subset and SHA-256 are bound into the immutable intent.
+
+The command is read-only unless both `--publish` and the exact arm phrase are
+present. A preview builds the canonical IDs and bounded lifecycle without publishing:
+
+```powershell
+uv run --locked kairos-paper-canary --symbol BTCUSDT --side LONG
+```
+
+The fixed strategy revision is `technical-canary@1`; supported symbols are only
+BTC, ETH, SOL, BNB, and XRP through the fixed Binance/EVEDEX DEV map. Stop distance
+is constrained to 25–100 bps, target distance to 25–150 bps and at most twice the
+stop, entry expiry to 5–30 seconds after the next-bar boundary, and holding timeout
+to 1–15 minutes. Current EVEDEX worst-entry geometry is checked before any publish.
+Quantity is exactly `max(minQuantity, ceil(minVolume / worstEntry / quantityIncrement)
+* quantityIncrement)` and must align with current price/quantity increments and bounds.
+Risk rejects the canary when that exact venue minimum does not fit the normal loss,
+notional, liquidity, allocation, or portfolio caps; it never rounds the decision up.
+The account must be fresh/reconciled and cannot contain another canary, a same-symbol
+position/order, or an unresolved canary risk reservation.
+
+An armed session requires PAPER mode, the durable bus, DEV profile, and
+`technical-canary@1` in `KAIROS_PAPER_STRATEGY_ALLOWLIST`:
+
+```powershell
+uv run --locked kairos-paper-canary --symbol BTCUSDT --side LONG `
+  --publish --arm "ARM EVEDEX DEV PAPER CANARY"
+```
+
+Publication is one PostgreSQL transaction: the controller stores a single-use arm
+bound to the exact review, intent, account, signal/venue symbols and expiry, stores a
+canonical deterministic allocation (0.25% `technical-canary`, 99.75% stable reserve,
+direction-compatible non-CHOP regime, 1x), and enqueues that exact
+`CandidateReviewV1(ALLOW)` in the outbox. There is no separate allocation stream or
+ACK race.
+
+The Risk PAPER consumer claims that exact arm in its own serialized PostgreSQL
+transaction while the durable review inbox transaction is active. A crash between
+the two is safe because the consumed arm is immutable and replayable by review ID.
+Risk sizes only with the allocation bytes stored on the arm;
+an in-memory Macro value cannot replace them, and a direct-bus canary `ALLOW` without
+the arm is rejected. Generic promoted strategies continue to use the normal Macro
+allocation stream. Publishing the resulting `RiskTradeDecisionV1` and acknowledging
+the review remain in the durable inbox/outbox transaction. Deterministic IDs make a
+same-payload retry or crash replay idempotent. One process invocation can prepare at
+most one candidate, while Risk independently enforces the global one-canary cap.
+
 ## Legacy DRY_RUN sizing and offline policy evaluation
 
 On the legacy DRY_RUN path, `KAIROS_PER_TRADE_RISK_FRACTION=0.02` is an equity

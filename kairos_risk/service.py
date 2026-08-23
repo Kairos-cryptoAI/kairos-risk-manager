@@ -25,8 +25,15 @@ from kairos_core.topics import Topics
 from kairos_persistence import DurableMessageBus
 
 from .account import AccountState
+from .canary_authorization import (
+    CanaryAuthorizationError,
+    PaperCanaryArmRepository,
+    RejectAllPaperCanaryArmRepository,
+    allocation_from_consumed_arm,
+    build_persistence_canary_repository,
+)
 from .circuit_breaker import CircuitBreakerRegistry
-from .config import RiskSettings
+from .config import PAPER_CANARY_STRATEGY_ID, RiskSettings
 from .paper import PaperRiskPipeline
 from .paper_runtime import (
     PaperInputDeadlineExceeded,
@@ -55,7 +62,12 @@ class _Control(KairosMessage):
 
 
 class RiskService:
-    def __init__(self, settings: RiskSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: RiskSettings | None = None,
+        *,
+        paper_canary_repository: PaperCanaryArmRepository | None = None,
+    ) -> None:
         self.settings = settings or RiskSettings()
         transport = build_bus(self.settings)
         self.bus = (
@@ -66,6 +78,8 @@ class RiskService:
         self.pipeline = RiskPipeline(self.settings)
         self.paper_pipeline = PaperRiskPipeline(self.settings)
         self.paper = PaperRiskCoordinator(self.settings, self.paper_pipeline)
+        self.paper_canary_repository = paper_canary_repository or RejectAllPaperCanaryArmRepository()
+        self._paper_canary_repository_explicit = paper_canary_repository is not None
         self.breakers = CircuitBreakerRegistry(
             self.settings.breaker_max_consecutive_failures,
             self.settings.breaker_cooldown_s,
@@ -258,14 +272,43 @@ class RiskService:
 
     async def _handle_paper_review(self, env: BusEnvelope) -> None:
         review = CandidateReviewV1.model_validate(env.payload)
+        is_canary = review.intent.strategy_id == PAPER_CANARY_STRATEGY_ID
+        canary_allocation: StrategicAllocation | None = None
+        admission_rejections: tuple[str, ...] = ()
+        canary_arm_checked = False
         while True:
             await self.paper.wait_for_inputs(review, now_ms=self._now_ms)
+            observed_now_ms = self._now_ms()
+            decided_at_ms = observed_now_ms
+            if is_canary and not canary_arm_checked:
+                arm = await self.paper_canary_repository.consume(
+                    account_id=self.settings.paper_account_id,
+                    review=review,
+                )
+                canary_arm_checked = True
+                if arm is None:
+                    admission_rejections = ("technical_canary_arm_missing",)
+                else:
+                    try:
+                        canary_allocation, decided_at_ms = allocation_from_consumed_arm(
+                            arm,
+                            review,
+                            account_id=self.settings.paper_account_id,
+                            now_ms=observed_now_ms,
+                        )
+                    except CanaryAuthorizationError:
+                        admission_rejections = ("technical_canary_arm_invalid",)
+                        log.exception(
+                            "risk.technical_canary_arm_invalid",
+                            review_id=review.review_id,
+                        )
             try:
                 decision = await self.paper.evaluate(
                     review,
-                    allocation=self.strategic_allocation,
-                    decided_at_ms=self._now_ms(),
+                    allocation=canary_allocation if is_canary else self.strategic_allocation,
+                    decided_at_ms=decided_at_ms,
                     system_mode=self.breakers.system_mode,
+                    admission_rejection_reasons=admission_rejections,
                 )
                 break
             except PaperInputUnavailable:
@@ -559,6 +602,8 @@ class RiskService:
         if not isinstance(self.bus, DurableMessageBus):
             raise RuntimeError("PAPER recovery requires DurableMessageBus")
         await self.bus.start()
+        if not self._paper_canary_repository_explicit:
+            self.paper_canary_repository = build_persistence_canary_repository(self.bus.database.pool)
         recovered_at_ms = self._now_ms()
         rows = await self.bus.database.pool.fetch(
             """SELECT payload FROM event_audit

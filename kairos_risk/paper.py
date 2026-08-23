@@ -31,6 +31,7 @@ from kairos_core.enums import (
     TradingMode,
 )
 
+from .canary_instrument import bound_canary_quantity
 from .config import PAPER_CANARY_STRATEGY_ID, PAPER_DEV_SYMBOL_MAP, RiskSettings
 from .strategy import allocation_error
 
@@ -92,6 +93,7 @@ class PaperRiskPipeline:
         decided_at_ms: int,
         system_mode: SystemMode = SystemMode.NORMAL,
         reservations: PaperReservations | None = None,
+        admission_rejection_reasons: tuple[str, ...] = (),
     ) -> RiskTradeDecisionV1:
         """Return an approved or explicit rejected ``RiskTradeDecisionV1``.
 
@@ -110,7 +112,9 @@ class PaperRiskPipeline:
         intent = review.intent
         output_time_ms = max(decided_at_ms, review.reviewed_at_ms)
         expected_symbol = PAPER_DEV_SYMBOL_MAP.get(intent.symbol)
-        reasons: list[str] = []
+        if any(not reason or reason != reason.strip() for reason in admission_rejection_reasons):
+            raise ValueError("admission rejection reasons must be normalized non-empty strings")
+        reasons: list[str] = list(dict.fromkeys(admission_rejection_reasons))
 
         if review.route.intent.model_dump(mode="json") != intent.model_dump(mode="json"):
             reasons.append("immutable_intent_mismatch")
@@ -188,7 +192,7 @@ class PaperRiskPipeline:
                 leverage = 1.0
 
         if not reasons and account_metrics is not None and allocation_metrics is not None:
-            quantity = self._size_quantity(
+            capacity_quantity = self._size_quantity(
                 intent_side=intent.side,
                 stop_price=intent.exit_plan.stop_price,
                 worst_entry=worst_entry,
@@ -199,6 +203,24 @@ class PaperRiskPipeline:
                 allocation=allocation_metrics,
                 reservations=reservations,
             )
+            if intent.strategy_id == PAPER_CANARY_STRATEGY_ID:
+                try:
+                    required_quantity = bound_canary_quantity(
+                        intent,
+                        account_id=self.settings.paper_account_id,
+                        worst_entry_price=worst_entry,
+                    )
+                except ValueError:
+                    reasons.append("canary_instrument_binding_invalid")
+                else:
+                    if not math.isclose(leverage, 1.0, rel_tol=0, abs_tol=1e-12):
+                        reasons.append("canary_leverage_must_equal_one")
+                    elif required_quantity > capacity_quantity + 1e-12:
+                        reasons.append("canary_minimum_exceeds_risk_capacity")
+                    else:
+                        quantity = required_quantity
+            else:
+                quantity = capacity_quantity
             notional = quantity * worst_entry
             if quantity <= 0:
                 reasons.append("position_capacity_exhausted")

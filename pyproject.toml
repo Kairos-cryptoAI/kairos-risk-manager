@@ -11,6 +11,7 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "TheLitis" }]
 dependencies = [
+    "aiohttp>=3.12,<4",
     "kairos-core>=0.3.0,<0.4.0",
     "kairos-persistence>=0.1,<0.2",
     "redis>=6.4,<9",
@@ -30,6 +31,7 @@ dev = [
 
 [project.scripts]
 kairos-risk-manager = "kairos_risk.service:main"
+kairos-paper-canary = "kairos_risk.canary:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_risk"]
@@ -39,7 +41,7 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "a4f427cdd44184fac62a842320133ac5a3e11fbe" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "a6fee2115e7dc1aff8389b0a6fe9c7e1fadcdff6" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "cf292a40e3325a4c6eab8f963541801e06bd22cf" }
 
 [tool.ruff]
 line-length = 110
@@ -55,3 +57,4 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["integration: requires a real TimescaleDB instance"]

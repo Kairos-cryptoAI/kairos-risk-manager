@@ -3,23 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 
 import pytest
 from kairos_core.bus import BusEnvelope
-from kairos_core.contracts import OpenOrderSnapshotV2
+from kairos_core.contracts import CandidateReviewV1, OpenOrderSnapshotV2
 from kairos_core.enums import (
+    MarketRegime,
     OrderRole,
     OrderSide,
     OrderStatus,
     OrderType,
+    Side,
     SystemMode,
     TradingMode,
 )
 from kairos_core.topics import Topics
 
+from kairos_risk.canary import CanaryInputs, CanaryPlan, prepare_canary
+from kairos_risk.canary_authorization import (
+    PaperCanaryArmRecord,
+    canary_arm_identity,
+)
 from kairos_risk.config import RiskSettings
 from kairos_risk.paper_runtime import PaperInputUnavailable, PaperRiskCoordinator
 from kairos_risk.service import RiskService
+from tests.test_canary import FakePaperCanaryArm
+from tests.test_canary import _bar as _canary_bar
+from tests.test_canary import _instrument as _canary_instrument
 from tests.test_paper import (
     NOW,
     T0,
@@ -36,6 +48,60 @@ from tests.test_service import FakeBus
 
 def _envelope(topic: str, message: object, *, envelope_id: str = "paper-1") -> BusEnvelope:
     return BusEnvelope(id=envelope_id, topic=topic, payload=message.to_payload())
+
+
+@dataclass
+class FakeCanaryArmRepository:
+    result: PaperCanaryArmRecord | None
+    consumes: list[tuple[str, str | None]] = field(default_factory=list)
+
+    async def consume(
+        self,
+        *,
+        account_id: str,
+        review: CandidateReviewV1,
+    ) -> PaperCanaryArmRecord | None:
+        self.consumes.append((account_id, review.review_id))
+        return self.result
+
+    async def arm(self, **_kwargs: object) -> PaperCanaryArmRecord:
+        raise AssertionError("Risk PAPER repository attempted to arm a canary")
+
+
+def _armed_canary(
+    *,
+    target_distance_bps: float = 75.0,
+) -> tuple[CandidateReviewV1, PaperCanaryArmRecord]:
+    prepared = prepare_canary(
+        CanaryPlan(
+            symbol="BTCUSDT",
+            side=Side.LONG,
+            target_distance_bps=target_distance_bps,
+        ),
+        CanaryInputs(
+            bar=_canary_bar(),
+            venue=_venue(),
+            account=_account(),
+            instrument=_canary_instrument(),
+        ),
+        account_id="kairos-paper-dev-01",
+        now_ms=NOW,
+        account_max_age_ms=30_000,
+        allocation_max_age_s=1_000,
+    )
+    return prepared.review, FakePaperCanaryArm(
+        arm_id=canary_arm_identity(
+            account_id="kairos-paper-dev-01",
+            review=prepared.review,
+            allocation=prepared.allocation,
+        ),
+        account_id="kairos-paper-dev-01",
+        review=prepared.review,
+        allocation=prepared.allocation,
+        status="CONSUMED",
+        expires_at=datetime.fromtimestamp(prepared.review.intent.entry_expires_ts_ms / 1_000, tz=UTC),
+        decided_at_ms=NOW,
+    )
 
 
 @pytest.mark.asyncio
@@ -131,18 +197,18 @@ async def test_technical_canary_reservation_blocks_another_symbol_globally() -> 
     await coordinator.restore_reservations(())
     await coordinator.apply_account(_account())
     await coordinator.apply_venue(_venue())
+    first_review, first_arm = _armed_canary()
     first = await coordinator.evaluate(
-        _review(),
-        allocation=_allocation(),
+        first_review,
+        allocation=first_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
 
-    await coordinator.apply_venue(_venue(symbol="ETHUSD:DEV"))
-    second_intent = _intent(symbol="ETHUSDT", metadata=(("candidate", "eth"),))
+    second_review, second_arm = _armed_canary(target_distance_bps=80.0)
     second = await coordinator.evaluate(
-        _review(intent=second_intent),
-        allocation=_allocation(),
+        second_review,
+        allocation=second_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
@@ -217,13 +283,14 @@ def test_retired_false_dry_run_environment_flag_fails_startup(monkeypatch) -> No
 
 @pytest.mark.asyncio
 async def test_service_publishes_decision_before_acknowledging_review() -> None:
-    service = RiskService(_settings())
+    review, arm = _armed_canary()
+    repository = FakeCanaryArmRepository(arm)
+    service = RiskService(_settings(), paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())
-    service.strategic_allocation = _allocation()
+    service.strategic_allocation = _allocation(regime=MarketRegime.CHOP)
     service._now_ms = lambda: NOW  # type: ignore[method-assign]
-    review = _review()
     bus = FakeBus(
         {Topics.CANDIDATE_REVIEW: [_envelope(Topics.CANDIDATE_REVIEW, review, envelope_id="review-1")]}
     )
@@ -236,18 +303,21 @@ async def test_service_publishes_decision_before_acknowledging_review() -> None:
         ("ack", Topics.CANDIDATE_REVIEW),
     ]
     assert bus.published[0][1].approved
+    assert repository.consumes == [("kairos-paper-dev-01", review.review_id)]
     assert bus.acks == [(Topics.CANDIDATE_REVIEW, "review-1")]
     await service.close()
 
 
 @pytest.mark.asyncio
 async def test_service_review_wakes_immediately_when_venue_quality_arrives() -> None:
-    service = RiskService(_settings())
+    review, arm = _armed_canary()
+    service = RiskService(
+        _settings(),
+        paper_canary_repository=FakeCanaryArmRepository(arm),
+    )
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
-    service.strategic_allocation = _allocation()
     service._now_ms = lambda: NOW  # type: ignore[method-assign]
-    review = _review()
     bus = FakeBus({Topics.CANDIDATE_REVIEW: [_envelope(Topics.CANDIDATE_REVIEW, review)]})
     service.bus = bus
 
@@ -264,6 +334,136 @@ async def test_service_review_wakes_immediately_when_venue_quality_arrives() -> 
         ("ack", Topics.CANDIDATE_REVIEW),
     ]
     assert bus.published[0][1].approved
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_bus_canary_allow_without_durable_arm_is_explicitly_rejected() -> None:
+    review, _arm = _armed_canary()
+    repository = FakeCanaryArmRepository(None)
+    service = RiskService(_settings(), paper_canary_repository=repository)
+    await service.paper.restore_reservations(())
+    await service.paper.apply_account(_account())
+    await service.paper.apply_venue(_venue())
+    service.strategic_allocation = _allocation()
+    service._now_ms = lambda: NOW  # type: ignore[method-assign]
+    bus = FakeBus({Topics.CANDIDATE_REVIEW: [_envelope(Topics.CANDIDATE_REVIEW, review)]})
+    service.bus = bus
+
+    await service._consume_paper_reviews()
+
+    decision = bus.published[0][1]
+    assert not decision.approved
+    assert "technical_canary_arm_missing" in decision.rejection_reasons
+    assert repository.consumes == [("kairos-paper-dev-01", review.review_id)]
+    assert bus.events == [
+        ("publish", Topics.RISK_TRADE_DECISION),
+        ("ack", Topics.CANDIDATE_REVIEW),
+    ]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_durable_canary_arm_is_rejected_and_review_is_acknowledged() -> None:
+    review, arm = _armed_canary()
+    repository = FakeCanaryArmRepository(replace(arm, status="ARMED"))
+    service = RiskService(_settings(), paper_canary_repository=repository)
+    await service.paper.restore_reservations(())
+    await service.paper.apply_account(_account())
+    await service.paper.apply_venue(_venue())
+    service._now_ms = lambda: NOW  # type: ignore[method-assign]
+    bus = FakeBus({Topics.CANDIDATE_REVIEW: [_envelope(Topics.CANDIDATE_REVIEW, review)]})
+    service.bus = bus
+
+    await service._consume_paper_reviews()
+
+    decision = bus.published[0][1]
+    assert not decision.approved
+    assert "technical_canary_arm_invalid" in decision.rejection_reasons
+    assert bus.events == [
+        ("publish", Topics.RISK_TRADE_DECISION),
+        ("ack", Topics.CANDIDATE_REVIEW),
+    ]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_arm_cannot_reuse_an_approved_in_process_cache_entry() -> None:
+    review, arm = _armed_canary()
+    repository = FakeCanaryArmRepository(arm)
+    service = RiskService(_settings(), paper_canary_repository=repository)
+    await service.paper.restore_reservations(())
+    await service.paper.apply_account(_account())
+    await service.paper.apply_venue(_venue())
+    service._now_ms = lambda: NOW  # type: ignore[method-assign]
+    bus = FakeBus()
+    service.bus = bus
+
+    await service._handle_paper_review(_envelope(Topics.CANDIDATE_REVIEW, review))
+    repository.result = None
+    await service._handle_paper_review(_envelope(Topics.CANDIDATE_REVIEW, review, envelope_id="replay"))
+
+    assert bus.published[0][1].approved
+    assert not bus.published[1][1].approved
+    assert "technical_canary_arm_missing" in bus.published[1][1].rejection_reasons
+    assert repository.consumes == [
+        ("kairos-paper-dev-01", review.review_id),
+        ("kairos-paper-dev-01", review.review_id),
+    ]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_consumed_arm_and_decision_replay_identically_after_risk_restart() -> None:
+    review, arm = _armed_canary()
+    first_repository = FakeCanaryArmRepository(arm)
+    first_service = RiskService(_settings(), paper_canary_repository=first_repository)
+    await first_service.paper.restore_reservations(())
+    await first_service.paper.apply_account(_account())
+    await first_service.paper.apply_venue(_venue())
+    first_service._now_ms = lambda: NOW  # type: ignore[method-assign]
+    first_bus = FakeBus()
+    first_service.bus = first_bus
+    await first_service._handle_paper_review(_envelope(Topics.CANDIDATE_REVIEW, review))
+    first_decision = first_bus.published[0][1]
+    assert first_decision.approved
+
+    replay_repository = FakeCanaryArmRepository(arm)
+    restarted = RiskService(_settings(), paper_canary_repository=replay_repository)
+    await restarted.paper.restore_reservations((first_decision,))
+    await restarted.paper.apply_account(_account(reconciliation_seq=2))
+    await restarted.paper.apply_venue(_venue())
+    restarted._now_ms = lambda: NOW  # type: ignore[method-assign]
+    replay_bus = FakeBus()
+    restarted.bus = replay_bus
+    await restarted._handle_paper_review(
+        _envelope(Topics.CANDIDATE_REVIEW, review, envelope_id="after-restart")
+    )
+
+    assert replay_bus.published[0][1].to_json() == first_decision.to_json()
+    assert replay_repository.consumes == [("kairos-paper-dev-01", review.review_id)]
+    await first_service.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_promoted_strategy_keeps_macro_allocation_path_and_never_claims_canary_arm() -> None:
+    repository = FakeCanaryArmRepository(None)
+    settings = _settings(paper_strategy_allowlist=["promoted-alpha@1"])
+    service = RiskService(settings, paper_canary_repository=repository)
+    await service.paper.restore_reservations(())
+    await service.paper.apply_account(_account())
+    await service.paper.apply_venue(_venue())
+    service.strategic_allocation = _allocation(strategy_id="promoted-alpha")
+    service._now_ms = lambda: NOW  # type: ignore[method-assign]
+    review = _review(intent=_intent(strategy_id="promoted-alpha", strategy_revision="1"))
+    bus = FakeBus({Topics.CANDIDATE_REVIEW: [_envelope(Topics.CANDIDATE_REVIEW, review)]})
+    service.bus = bus
+
+    await service._consume_paper_reviews()
+
+    assert bus.published[0][1].approved
+    assert repository.consumes == []
     await service.close()
 
 
@@ -362,9 +562,10 @@ async def test_restart_restored_canary_reservation_blocks_a_different_symbol() -
     await first_runtime.restore_reservations(())
     await first_runtime.apply_account(_account())
     await first_runtime.apply_venue(_venue())
+    first_review, first_arm = _armed_canary()
     first = await first_runtime.evaluate(
-        _review(),
-        allocation=_allocation(),
+        first_review,
+        allocation=first_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
@@ -372,10 +573,11 @@ async def test_restart_restored_canary_reservation_blocks_a_different_symbol() -
     restarted = PaperRiskCoordinator(_settings())
     await restarted.restore_reservations((first,))
     await restarted.apply_account(_account(reconciliation_seq=2))
-    await restarted.apply_venue(_venue(symbol="ETHUSD:DEV"))
+    await restarted.apply_venue(_venue())
+    second_review, second_arm = _armed_canary(target_distance_bps=80.0)
     second = await restarted.evaluate(
-        _review(intent=_intent(symbol="ETHUSDT", metadata=(("after", "restart-eth"),))),
-        allocation=_allocation(),
+        second_review,
+        allocation=second_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
@@ -391,9 +593,10 @@ async def test_unreconciled_snapshot_cannot_clear_a_recovered_reservation() -> N
     await first_runtime.restore_reservations(())
     await first_runtime.apply_account(_account())
     await first_runtime.apply_venue(_venue())
+    first_review, first_arm = _armed_canary()
     first = await first_runtime.evaluate(
-        _review(),
-        allocation=_allocation(),
+        first_review,
+        allocation=first_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
@@ -455,9 +658,10 @@ async def test_conflicting_reconciled_lineage_poisons_authority_and_keeps_reserv
     await first_runtime.restore_reservations(())
     await first_runtime.apply_account(_account())
     await first_runtime.apply_venue(_venue())
+    first_review, first_arm = _armed_canary()
     first = await first_runtime.evaluate(
-        _review(),
-        allocation=_allocation(),
+        first_review,
+        allocation=first_arm.allocation,
         decided_at_ms=NOW,
         system_mode=SystemMode.NORMAL,
     )
@@ -489,10 +693,11 @@ async def test_conflicting_reconciled_lineage_poisons_authority_and_keeps_reserv
     assert restarted.reservations.active_canary_ideas == 1
 
     await restarted.apply_account(_account(reconciliation_seq=3, captured_at_ms=NOW + 1))
-    await restarted.apply_venue(_venue(symbol="ETHUSD:DEV"))
+    await restarted.apply_venue(_venue())
+    second_review, second_arm = _armed_canary(target_distance_bps=80.0)
     second = await restarted.evaluate(
-        _review(intent=_intent(symbol="ETHUSDT", metadata=(("after", "lineage-conflict"),))),
-        allocation=_allocation(),
+        second_review,
+        allocation=second_arm.allocation,
         decided_at_ms=NOW + 1,
         system_mode=SystemMode.NORMAL,
     )
