@@ -245,6 +245,8 @@ class CanarySession:
         arm: str | None = None,
         account_max_age_ms: int = 30_000,
         allocation_max_age_s: float = 26 * 60 * 60,
+        session_id: str | None = None,
+        slot_id: str | None = None,
     ) -> CanaryRunResult:
         if self._used:
             raise CanaryError("this canary session already prepared one candidate")
@@ -253,6 +255,8 @@ class CanarySession:
             raise CanaryArmingError("exact DEV PAPER canary arm phrase is required for publication")
         if publish and self._arm_repository is None:
             raise CanaryArmingError("publication requested without a durable canary-arm repository")
+        if publish and (not session_id or not slot_id):
+            raise CanaryArmingError("publication requires a verified bounded session_id and slot_id")
 
         inputs = await self._source.load(plan, account_id=account_id)
         prepared = prepare_canary(
@@ -279,6 +283,8 @@ class CanarySession:
                 account_id=account_id,
                 review=prepared.review,
                 allocation=prepared.allocation,
+                session_id=session_id,
+                slot_id=slot_id,
             )
             arm_id = validate_armed_record(
                 armed_record,
@@ -744,6 +750,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--entry-window-seconds", type=int, default=30)
     parser.add_argument("--publish", action="store_true", help="atomically arm and enqueue one review")
+    parser.add_argument("--session-id", help="existing verified bounded session; required for publication")
+    parser.add_argument("--slot-id", help="exact immutable session slot; required for publication")
     parser.add_argument(
         "--arm",
         metavar="PHRASE",
@@ -766,6 +774,8 @@ async def _run_cli(args: argparse.Namespace) -> CanaryRunResult:
     if args.publish:
         if args.arm != CANARY_ARM_PHRASE:
             raise CanaryArmingError("exact DEV PAPER canary arm phrase is required for publication")
+        if not args.session_id or not args.slot_id:
+            raise CanaryArmingError("publication requires a verified bounded session_id and slot_id")
         _validate_publish_settings(settings)
         database = Database(PersistenceSettings())
         await database.connect()
@@ -779,6 +789,8 @@ async def _run_cli(args: argparse.Namespace) -> CanaryRunResult:
                 now_ms=now_ms,
                 publish=True,
                 arm=args.arm,
+                session_id=args.session_id,
+                slot_id=args.slot_id,
                 account_max_age_ms=int(settings.paper_account_snapshot_max_age_s * 1_000),
                 allocation_max_age_s=settings.strategic_allocation_max_age_s,
             )

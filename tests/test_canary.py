@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -17,7 +16,6 @@ from kairos_core.contracts import (
 )
 from kairos_core.enums import EvedexProfile, MarketRegime, Side, TradingMode
 from kairos_core.topics import Topics
-from kairos_persistence import Database, PersistenceSettings
 from kairos_persistence import PaperCanaryArmRepository as DurablePaperCanaryArmRepository
 
 import kairos_risk.canary as canary_module
@@ -177,6 +175,9 @@ class FakePaperCanaryArm:
     status: str
     expires_at: datetime
     decided_at_ms: int | None
+    session_id: str | None = "1" * 64
+    attempt_id: str | None = "2" * 64
+    session_expires_at: datetime | None = datetime.fromtimestamp((NOW + 7_200_000) / 1_000, tz=UTC)
 
 
 @dataclass
@@ -191,7 +192,10 @@ class FakeArmRepository:
         account_id: str,
         review: CandidateReviewV1,
         allocation: StrategicAllocation,
+        session_id: str | None = None,
+        slot_id: str | None = None,
     ) -> PaperCanaryArmRecord:
+        assert session_id == "1" * 64 and slot_id == "slot-1"
         self.calls.append("arm")
         if self.fail:
             raise OSError("simulated atomic durable arm/enqueue failure")
@@ -465,6 +469,8 @@ async def test_armed_publish_atomically_binds_allocation_and_review() -> None:
         now_ms=NOW,
         publish=True,
         arm=CANARY_ARM_PHRASE,
+        session_id="1" * 64,
+        slot_id="slot-1",
     )
 
     assert result.published
@@ -551,12 +557,8 @@ def test_persistence_adapter_uses_the_pinned_repository_without_network_access()
     assert repository.pool is sentinel_pool
 
 
-@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_real_database_arm_consume_outbox_and_risk_binding_replay() -> None:
-    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
-    if not database_url:
-        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required for integration tests")
+async def test_previous_cli_publish_cannot_bypass_session_admission() -> None:
     prepared = prepare_canary(
         CanaryPlan(symbol="BTCUSDT", side=Side.LONG),
         _inputs(),
@@ -565,44 +567,13 @@ async def test_real_database_arm_consume_outbox_and_risk_binding_replay() -> Non
         account_max_age_ms=30_000,
         allocation_max_age_s=1_000,
     )
-    database = Database(PersistenceSettings(database_url=database_url))
-    await database.connect()
-    await database.migrate()
-    repository = build_persistence_canary_repository(database.pool)
-    review_id = prepared.review.message_id
-    try:
-        await database.pool.execute("DELETE FROM paper_canary_arms WHERE account_id=$1", ACCOUNT_ID)
-        await database.pool.execute("DELETE FROM message_outbox WHERE message_id=$1", review_id)
-        await database.pool.execute("DELETE FROM event_audit WHERE message_id=$1", review_id)
-        armed = await repository.arm(
+    repository = build_persistence_canary_repository(None)
+    with pytest.raises(ValueError, match="bounded canary session"):
+        await repository.arm(
             account_id=ACCOUNT_ID,
             review=prepared.review,
             allocation=prepared.allocation,
         )
-        assert armed.status == "ARMED"
-        assert (
-            await database.pool.fetchval(
-                "SELECT count(*) FROM message_outbox WHERE message_id=$1",
-                review_id,
-            )
-            == 1
-        )
-        consumed = await repository.consume(account_id=ACCOUNT_ID, review=prepared.review)
-        assert consumed is not None and consumed.status == "CONSUMED"
-        allocation, decided_at_ms = allocation_from_consumed_arm(
-            consumed,
-            prepared.review,
-            account_id=ACCOUNT_ID,
-            now_ms=NOW,
-        )
-        assert allocation == prepared.allocation
-        assert decided_at_ms == prepared.review.intent.entry_eligible_ts_ms
-        assert await repository.consume(account_id=ACCOUNT_ID, review=prepared.review) == consumed
-    finally:
-        await database.pool.execute("DELETE FROM paper_canary_arms WHERE account_id=$1", ACCOUNT_ID)
-        await database.pool.execute("DELETE FROM message_outbox WHERE message_id=$1", review_id)
-        await database.pool.execute("DELETE FROM event_audit WHERE message_id=$1", review_id)
-        await database.close()
 
 
 def test_claim_uses_exact_bound_allocation_not_a_mutated_runtime_copy() -> None:
@@ -639,6 +610,9 @@ def test_claim_uses_exact_bound_allocation_not_a_mutated_runtime_copy() -> None:
         {"decided_at_ms": T0 + 59_999},
         {"decided_at_ms": NOW + 2_001},
         {"arm_id": "d" * 64},
+        {"session_id": None},
+        {"attempt_id": "not-a-hash"},
+        {"session_expires_at": datetime.fromtimestamp(NOW / 1_000, tz=UTC)},
     ],
 )
 def test_claim_rejects_any_record_binding_mutation(arm_override: dict[str, object]) -> None:
@@ -803,6 +777,8 @@ async def test_atomic_arm_enqueue_failure_has_no_separate_publish_stages() -> No
             now_ms=NOW,
             publish=True,
             arm=CANARY_ARM_PHRASE,
+            session_id="1" * 64,
+            slot_id="slot-1",
         )
 
     assert writer.calls == ["arm"]

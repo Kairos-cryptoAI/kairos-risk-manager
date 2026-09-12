@@ -20,7 +20,7 @@ from kairos_core.enums import (
     Side,
     StrategicTrigger,
 )
-from kairos_persistence import PaperCanaryArmRepository as PersistencePaperCanaryArmRepository
+from kairos_persistence.canary_arm import PaperCanaryArmRepository as PersistencePaperCanaryArmRepository
 
 from .canary_instrument import bound_canary_instrument
 from .config import PAPER_CANARY_STRATEGY_ID, PAPER_DEV_SYMBOL_MAP
@@ -47,6 +47,9 @@ class PaperCanaryArmRecord(Protocol):
     status: str
     expires_at: datetime
     decided_at_ms: int | None
+    session_id: str | None
+    attempt_id: str | None
+    session_expires_at: datetime | None
 
 
 class PaperCanaryArmRepository(Protocol):
@@ -58,6 +61,8 @@ class PaperCanaryArmRepository(Protocol):
         account_id: str,
         review: CandidateReviewV1,
         allocation: StrategicAllocation,
+        session_id: str | None = None,
+        slot_id: str | None = None,
     ) -> PaperCanaryArmRecord:
         """Atomically store the arm, audit the review and enqueue its outbox row."""
 
@@ -79,8 +84,10 @@ class RejectAllPaperCanaryArmRepository:
         account_id: str,
         review: CandidateReviewV1,
         allocation: StrategicAllocation,
+        session_id: str | None = None,
+        slot_id: str | None = None,
     ) -> PaperCanaryArmRecord:
-        del account_id, review, allocation
+        del account_id, review, allocation, session_id, slot_id
         raise CanaryAuthorizationError("durable PAPER canary repository is unavailable")
 
     async def consume(
@@ -213,6 +220,7 @@ def validate_armed_record(
 
     if arm.status not in {"ARMED", "CONSUMED"} or arm.account_id != account_id:
         raise CanaryAuthorizationError("persistence returned no active arm for this account")
+    _validate_session_binding(arm, now_ms=now_ms)
     if arm.review.model_dump(mode="json") != review.model_dump(mode="json") or arm.allocation.model_dump(
         mode="json"
     ) != allocation.model_dump(mode="json"):
@@ -245,6 +253,7 @@ def allocation_from_consumed_arm(
 
     if arm.status != "CONSUMED" or arm.account_id != account_id:
         raise CanaryAuthorizationError("durable canary arm is not consumed for this account")
+    _validate_session_binding(arm, now_ms=now_ms)
     if arm.review.model_dump(mode="json") != review.model_dump(mode="json"):
         raise CanaryAuthorizationError("durable canary arm does not match the exact review")
     expected_arm_id = canary_arm_identity(
@@ -274,6 +283,19 @@ def allocation_from_consumed_arm(
     except ValueError as exc:
         raise CanaryAuthorizationError("durable canary allocation is not the exact bound policy") from exc
     return arm.allocation, decided_at_ms
+
+
+def _validate_session_binding(arm: PaperCanaryArmRecord, *, now_ms: int) -> None:
+    for field in ("session_id", "attempt_id"):
+        value = getattr(arm, field, None)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise CanaryAuthorizationError("durable canary arm has no bounded session/attempt binding")
+    deadline = getattr(arm, "session_expires_at", None)
+    if deadline is None or deadline.utcoffset() is None:
+        raise CanaryAuthorizationError("durable canary session has no timezone-aware deadline")
+    deadline_ms = int(deadline.astimezone(UTC).timestamp() * 1_000)
+    if now_ms >= deadline_ms or arm.review.intent.entry_expires_ts_ms > deadline_ms:
+        raise CanaryAuthorizationError("durable canary session is expired or does not bound the entry")
 
 
 def _validate_canary_allocation(

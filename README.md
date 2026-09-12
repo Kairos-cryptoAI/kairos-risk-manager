@@ -168,11 +168,14 @@ notional, liquidity, allocation, or portfolio caps; it never rounds the decision
 The account must be fresh/reconciled and cannot contain another canary, a same-symbol
 position/order, or an unresolved canary risk reservation.
 
-An armed session requires PAPER mode, the durable bus, DEV profile, and
-`technical-canary@1` in `KAIROS_PAPER_STRATEGY_ALLOWLIST`:
+An armed session requires PAPER mode, the durable bus, DEV profile,
+`technical-canary@1` in `KAIROS_PAPER_STRATEGY_ALLOWLIST`, and a persisted bounded
+session derived from a verified, fresh 24-hour read-only receipt. An arm phrase
+alone no longer grants publication authority:
 
 ```powershell
 uv run --locked kairos-paper-canary --symbol BTCUSDT --side LONG `
+  --session-id <verified-session-id> --slot-id <exact-plan-slot> `
   --publish --arm "ARM EVEDEX DEV PAPER CANARY"
 ```
 
@@ -193,6 +196,22 @@ allocation stream. Publishing the resulting `RiskTradeDecisionV1` and acknowledg
 the review remain in the durable inbox/outbox transaction. Deterministic IDs make a
 same-payload retry or crash replay idempotent. One process invocation can prepare at
 most one candidate, while Risk independently enforces the global one-canary cap.
+
+The restartable controller is `uv run --locked python -m kairos_risk.canary_runner`.
+Its subcommands are `preview-plan`, `arm-session`, `status`, `stop` and `submit-next`;
+use `--help` for their explicit inputs. It has no polling/retry loop or receipt
+import shortcut. The database persists one session's maximum ten attempts/two-hour
+deadline, exact ordered slots, consumed reviews and terminal outcomes. A Risk
+refusal still consumes its reserved attempt. Changing accounts or restarting a
+process cannot create a second concurrent session. Stop enters draining and
+does not disable protection or recovery of existing exposure.
+
+Execution must independently verify the scope and commit a one-use dispatch
+claim immediately before entry. The controller cannot claim a completed
+scenario, a passed qualification, a real venue fill or strategy alpha. The live
+read-only recorder and end-to-end venue coverage remain separate acceptance
+requirements. See the version-pinned persistence dependency's
+`docs/BOUNDED_CANARY.md` for the evidence and dispatch contract.
 
 ## Legacy DRY_RUN sizing and offline policy evaluation
 
