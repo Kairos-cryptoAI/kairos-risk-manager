@@ -17,6 +17,7 @@ from .evaluation import RiskCase, RiskEvaluation, evaluate_policy
 from .paper import PaperReservations, PaperRiskPipeline
 from .paper_runtime import PaperInputDeadlineExceeded, PaperInputUnavailable, PaperRiskCoordinator
 from .pipeline import RiskPipeline
+from .simulation import SimulationRiskPolicy
 
 __all__ = [
     "AccountState",
@@ -24,6 +25,7 @@ __all__ = [
     "BreakerState",
     "CircuitBreakerRegistry",
     "RiskPipeline",
+    "SimulationRiskPolicy",
     "PaperRiskPipeline",
     "PaperReservations",
     "PaperRiskCoordinator",
