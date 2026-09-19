@@ -70,6 +70,12 @@ class SimulationRiskPolicy:
         intent = review.intent
         reasons: set[str] = set()
 
+        self._environment_rejection_reasons(
+            reasons=reasons,
+            session=session,
+            intent_venue=intent.venue,
+            selected_book_frame=selected_book_frame,
+        )
         if review.decision is not ReviewDecision.ALLOW:
             reasons.add(f"REVIEW_{review.decision.value}")
         if (intent.strategy_id, intent.strategy_revision) not in {
@@ -147,6 +153,33 @@ class SimulationRiskPolicy:
             raise ValueError("decided_at_ms cannot predate the immutable candidate review")
         if decided_at_ms < review.intent.entry_eligible_ts_ms:
             raise ValueError("decided_at_ms cannot predate immutable next-bar eligibility")
+
+    @staticmethod
+    def _environment_rejection_reasons(
+        *,
+        reasons: set[str],
+        session: SimulationSessionV1,
+        intent_venue: str,
+        selected_book_frame: RecordedTopNBookFrameV1 | None,
+    ) -> None:
+        """Fail closed if a caller bypassed strict Pydantic contract validation.
+
+        Normal deserialization cannot create these mismatches because the
+        versioned contracts use ``Literal`` fields.  They are still checked at
+        this public boundary so a manually constructed model instance cannot
+        turn a PAPER/venue-shaped object into an approved SIM decision.
+        """
+
+        if session.execution_environment != "SIMULATED":
+            reasons.add("SESSION_ENVIRONMENT_MISMATCH")
+        if intent_venue != "BINANCE_UM":
+            reasons.add("INTENT_VENUE_MISMATCH")
+        if selected_book_frame is None:
+            return
+        if selected_book_frame.execution_environment != "SIMULATED":
+            reasons.add("BOOK_FRAME_ENVIRONMENT_MISMATCH")
+        if selected_book_frame.market_data_venue != "BINANCE_UM":
+            reasons.add("BOOK_FRAME_VENUE_MISMATCH")
 
     @staticmethod
     def _book_rejection_reasons(

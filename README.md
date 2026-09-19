@@ -40,6 +40,25 @@ Two authority paths are deliberately isolated:
   command; missing reconciliation or allocation is observable instead of silently
   dropping the tactical event.
 
+## Isolated market-data simulator admission
+
+`kairos_risk.SimulationRiskPolicy` is a pure public API for the separate
+`SIMULATED` market-data simulator. It takes one immutable `SimulationSessionV1`,
+an existing `CandidateReviewV1`, a recorded Binance UM top-N book frame (or no
+frame), a supplied decision timestamp, and a requested research quantity. It
+returns only `SimulationRiskDecisionV1`; it never imports PAPER runtime code,
+uses an account or credentials, calls a network/venue, or constructs
+`RiskTradeDecisionV1`.
+
+The policy fail-closes to a zero-sized rejected record for missing, stale,
+future, discontinuous, wrong-tape/symbol, or non-SIMULATED book inputs. Its
+only approval path requires an `ALLOW` review, an allowlisted strategy, the
+fixed five-symbol Binance UM universe, a causal admitted book, valid exit
+geometry, and a frozen-session participation cap. A manually forged
+non-SIMULATED session or book is also rejected, so it cannot bridge into the
+PAPER authority path. Simulator decisions explicitly remain ineligible for
+PAPER qualification, Trial 15, or alpha claims.
+
 ## PAPER / EVEDEX DEV admission
 
 PAPER is restricted to the exact EVEDEX DEV profile, a dedicated non-production

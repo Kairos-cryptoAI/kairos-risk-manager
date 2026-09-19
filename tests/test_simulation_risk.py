@@ -17,6 +17,7 @@ from kairos_core.contracts import (
     SimulationStrategyRefV1,
     StrategyIntentV1,
     StrategyProvenanceV1,
+    canonical_sha256,
 )
 from kairos_core.enums import CandidateReviewTier, ReasoningEffort, ReviewDecision, Side
 
@@ -220,6 +221,31 @@ def test_unusable_book_frame_is_rejected_without_synthetic_fill(
     assert decision.quantity == 0
     assert decision.price_cap is None
     assert expected_reason in decision.rejection_reasons
+
+
+def test_environment_mismatches_cannot_become_simulator_approvals() -> None:
+    """Even a manually forged model instance remains a non-authorizing record."""
+
+    forged_session = _session().model_copy(update={"execution_environment": "PAPER"})
+    forged_session = forged_session.model_copy(
+        update={"session_id": canonical_sha256(forged_session.identity_payload())}
+    )
+    session_decision = _evaluate(session=forged_session)
+
+    forged_frame = _frame().model_copy(update={"execution_environment": "PAPER"})
+    forged_frame = forged_frame.model_copy(
+        update={"frame_sha256": canonical_sha256(forged_frame.identity_payload())}
+    )
+    frame_decision = _evaluate(selected_book_frame=forged_frame)
+
+    for decision, expected_reason in (
+        (session_decision, "SESSION_ENVIRONMENT_MISMATCH"),
+        (frame_decision, "BOOK_FRAME_ENVIRONMENT_MISMATCH"),
+    ):
+        assert not decision.approved
+        assert decision.quantity == 0
+        assert decision.price_cap is None
+        assert expected_reason in decision.rejection_reasons
 
 
 def test_stale_and_expired_inputs_remain_rejected_evidence() -> None:
