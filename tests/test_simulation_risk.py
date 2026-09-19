@@ -276,15 +276,10 @@ def test_policy_module_has_no_non_simulator_import_path() -> None:
     module = Path(__file__).parents[1] / "kairos_risk" / "simulation.py"
     tree = ast.parse(module.read_text(encoding="utf-8"))
     imported_modules = {
-        alias.name.lower()
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
+        alias.name.lower() for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
     }
     imported_modules.update(
-        (node.module or "").lower()
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
+        (node.module or "").lower() for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     )
     imported_names = {
         alias.name.lower()
