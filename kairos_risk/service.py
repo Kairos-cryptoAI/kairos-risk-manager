@@ -120,9 +120,20 @@ class RiskService:
 
     def record_llm_success(self, model: str, provider: str | None = None) -> None:
         """Recover a model and, when known, its aggregate provider breaker."""
+        inferred_provider = self.breakers.infer_provider(model)
+        resolved_provider = provider or inferred_provider
+        # A success attributed to the wrong provider cannot prove that a
+        # current model route recovered, even at the model level.
+        if (
+            model in self.breakers.CURRENT_MODELS
+            and resolved_provider
+            and self.breakers.normalize_provider(resolved_provider) != inferred_provider
+        ):
+            return
         self.breakers.record_success(model)
-        resolved_provider = provider or self.breakers.infer_provider(model)
-        if resolved_provider:
+        # A success from a historical or unknown model does not prove the
+        # current provider route has recovered.
+        if resolved_provider and model in self.breakers.CURRENT_MODELS:
             self.breakers.record_provider_success(resolved_provider)
 
     def apply_health_event(

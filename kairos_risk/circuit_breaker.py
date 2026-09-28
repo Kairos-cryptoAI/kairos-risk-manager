@@ -75,22 +75,30 @@ class CircuitBreaker:
 class CircuitBreakerRegistry:
     """Model and provider breakers collapsed into one fail-safe ``SystemMode``.
 
-    The model mapping preserves the narrowest safe degradation while still failing
-    closed for an unavailable hot path, multiple model outages, an unknown model, or
-    an aggregated OpenAI provider outage.
+    Flash alone can use the local text filter. Every other model outage fails
+    closed: Sol serves both conflict aggregation and Macro allocation, so a
+    conflict-only degradation would leave a required path unavailable.
     """
 
-    FLASH = "deepseek-v4-flash"
-    LUNA = "gpt-5.6-luna"
-    TERRA = "gpt-5.6-terra"
-    SOL = "gpt-5.6-sol"
+    FLASH = "deepseek-flash"
+    LUNA = "gpt-6-luna"
+    SOL = "gpt-6-sol"
     OPENAI = "openai"
 
-    # Backwards-compatible name used by older callers and tests.
+    # Keep historical event identities available, but never treat an outage
+    # from an obsolete route as an outage of a current, independently safe role.
+    LEGACY_FLASH = "deepseek-v4-flash"
+    LEGACY_LUNA = "gpt-5.6-luna"
+    TERRA = "gpt-5.6-terra"
+    LEGACY_SOL = "gpt-5.6-sol"
+
+    # Backwards-compatible role name used by older callers and tests.
     GPT = SOL
 
-    KNOWN_MODELS = frozenset((FLASH, LUNA, TERRA, SOL))
-    OPENAI_MODELS = frozenset((LUNA, TERRA, SOL))
+    CURRENT_MODELS = frozenset((FLASH, LUNA, SOL))
+    LEGACY_MODELS = frozenset((LEGACY_FLASH, LEGACY_LUNA, TERRA, LEGACY_SOL))
+    KNOWN_MODELS = CURRENT_MODELS | LEGACY_MODELS
+    OPENAI_MODELS = frozenset((LUNA, SOL, LEGACY_LUNA, TERRA, LEGACY_SOL))
 
     def __init__(self, max_consecutive_failures: int = 2, cooldown_s: float = 300.0) -> None:
         self._max = max_consecutive_failures
@@ -149,14 +157,8 @@ class CircuitBreakerRegistry:
             return SystemMode.LOCAL_QUANT_MODE
 
         down_models = {model for model, breaker in self._breakers.items() if not breaker.llm_allowed}
-        if len(down_models) >= 2 or self.LUNA in down_models:
+        if down_models - {self.FLASH}:
             return SystemMode.LOCAL_QUANT_MODE
-        if down_models & {self.TERRA, self.SOL}:
-            return SystemMode.CONFLICT_SAFE
         if self.FLASH in down_models:
             return SystemMode.TEXT_LOCAL_FILTER
-        if down_models - self.KNOWN_MODELS:
-            # A newly introduced or misspelled model must not silently bypass risk
-            # degradation merely because this package does not know its role yet.
-            return SystemMode.LOCAL_QUANT_MODE
         return SystemMode.NORMAL

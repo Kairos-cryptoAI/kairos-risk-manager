@@ -129,13 +129,14 @@ publishes changes on `kairos.system.control`. It deliberately does not subscribe
 own control stream; command validation reads the same authoritative breaker registry
 that produced the broadcast.
 
-The health registry tracks `deepseek-v4-flash`, `gpt-5.6-luna`, `gpt-5.6-terra`, and
-`gpt-5.6-sol` independently. A Flash outage selects `TEXT_LOCAL_FILTER`; a Luna outage
-selects fail-closed `LOCAL_QUANT_MODE`; a Terra or Sol outage selects `CONFLICT_SAFE`.
-Two or more unavailable models, an unknown unavailable model, or an aggregated OpenAI
-connection/rate-limit outage selects `LOCAL_QUANT_MODE`. Successful calls recover only
-the named model and its provider aggregate. Bad output and permanent HTTP/client errors
-remain visible health failures but do not represent an availability outage.
+The current health registry tracks `deepseek-flash`, `gpt-6-luna`, and `gpt-6-sol`.
+The Sol route serves both conflict aggregation and Macro allocation. A Flash-only
+outage selects `TEXT_LOCAL_FILTER`; a Luna or Sol outage selects fail-closed
+`LOCAL_QUANT_MODE`. An unavailable historical model ID, an unknown model ID, or an
+aggregated OpenAI connection/rate-limit outage also selects `LOCAL_QUANT_MODE`.
+Successful calls recover only the named model; only a current model can recover
+its provider aggregate. Bad output and permanent HTTP/client errors remain visible
+health failures but do not represent an availability outage.
 
 ## PAPER loss-at-stop sizing
 

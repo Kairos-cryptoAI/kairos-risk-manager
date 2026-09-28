@@ -41,7 +41,7 @@ def test_registry_stays_degraded_while_probe_is_half_open():
     breaker._maybe_half_open(now=301.0)
 
     assert breaker._state is BreakerState.HALF_OPEN
-    assert registry.system_mode is SystemMode.CONFLICT_SAFE
+    assert registry.system_mode is SystemMode.LOCAL_QUANT_MODE
     breaker.record_success()
     assert registry.system_mode is SystemMode.NORMAL
 
@@ -74,8 +74,7 @@ def test_model_outages_map_to_fail_safe_modes():
     expected_modes = {
         CircuitBreakerRegistry.FLASH: SystemMode.TEXT_LOCAL_FILTER,
         CircuitBreakerRegistry.LUNA: SystemMode.LOCAL_QUANT_MODE,
-        CircuitBreakerRegistry.TERRA: SystemMode.CONFLICT_SAFE,
-        CircuitBreakerRegistry.SOL: SystemMode.CONFLICT_SAFE,
+        CircuitBreakerRegistry.SOL: SystemMode.LOCAL_QUANT_MODE,
     }
 
     for model, expected_mode in expected_modes.items():
@@ -86,8 +85,8 @@ def test_model_outages_map_to_fail_safe_modes():
 
 def test_two_models_down_enters_local_quant_mode():
     reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+    _trip(reg, CircuitBreakerRegistry.FLASH)
     _trip(reg, CircuitBreakerRegistry.SOL)
-    _trip(reg, CircuitBreakerRegistry.TERRA)
     assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
 
 
@@ -113,6 +112,13 @@ def test_unknown_model_outage_fails_closed():
     assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
 
 
+def test_historical_model_outages_fail_closed():
+    for model in CircuitBreakerRegistry.LEGACY_MODELS:
+        reg = CircuitBreakerRegistry(max_consecutive_failures=2)
+        _trip(reg, model)
+        assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+
 def test_legacy_gpt_alias_still_targets_sol():
     assert CircuitBreakerRegistry.GPT == CircuitBreakerRegistry.SOL
 
@@ -120,10 +126,10 @@ def test_legacy_gpt_alias_still_targets_sol():
 def test_recovery_recomputes_mode_from_remaining_outages():
     reg = CircuitBreakerRegistry(max_consecutive_failures=2)
     _trip(reg, CircuitBreakerRegistry.FLASH)
-    _trip(reg, CircuitBreakerRegistry.TERRA)
+    _trip(reg, CircuitBreakerRegistry.SOL)
     assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
 
-    reg.record_success(CircuitBreakerRegistry.TERRA)
+    reg.record_success(CircuitBreakerRegistry.SOL)
     assert reg.system_mode is SystemMode.TEXT_LOCAL_FILTER
     reg.record_success(CircuitBreakerRegistry.FLASH)
     assert reg.system_mode is SystemMode.NORMAL
@@ -148,8 +154,11 @@ def test_provider_inference_covers_current_and_future_model_families():
         CircuitBreakerRegistry.FLASH: "deepseek",
         "deepseek-v5": "deepseek",
         CircuitBreakerRegistry.LUNA: "openai",
+        CircuitBreakerRegistry.LEGACY_FLASH: "deepseek",
+        CircuitBreakerRegistry.LEGACY_LUNA: "openai",
         CircuitBreakerRegistry.TERRA: "openai",
         CircuitBreakerRegistry.SOL: "openai",
+        CircuitBreakerRegistry.LEGACY_SOL: "openai",
         "gpt-6-future": "openai",
         "unknown-model": None,
     }
