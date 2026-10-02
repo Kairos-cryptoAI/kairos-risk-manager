@@ -22,7 +22,9 @@ from kairos_core.contracts.base import KairosMessage
 from kairos_core.enums import ReasonCode, SystemMode, TradingMode
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
-from kairos_persistence import DurableMessageBus
+from kairos_persistence import DurableMessageBus, MigrationProfile
+from kairos_persistence.canary_session import CanaryScope
+from kairos_persistence.operator_control import OperatorControlRepository, OperatorSnapshotV1
 
 from .account import AccountState
 from .canary_authorization import (
@@ -34,6 +36,11 @@ from .canary_authorization import (
 )
 from .circuit_breaker import CircuitBreakerRegistry
 from .config import PAPER_CANARY_STRATEGY_ID, RiskSettings
+from .operator_control import (
+    PaperOperatorRepository,
+    RejectAllPaperOperatorRepository,
+    load_operator_scope,
+)
 from .paper import PaperRiskPipeline
 from .paper_runtime import (
     PaperInputDeadlineExceeded,
@@ -67,19 +74,39 @@ class RiskService:
         settings: RiskSettings | None = None,
         *,
         paper_canary_repository: PaperCanaryArmRepository | None = None,
+        paper_operator_repository: PaperOperatorRepository | None = None,
+        paper_operator_scope: CanaryScope | None = None,
     ) -> None:
         self.settings = settings or RiskSettings()
         transport = build_bus(self.settings)
         self.bus = (
             transport
             if self.settings.bus_backend == "memory"
-            else DurableMessageBus(transport, service_name=self.settings.service_name)
+            else DurableMessageBus(
+                transport,
+                service_name=self.settings.service_name,
+                verify_schema_only=self.settings.trading_mode is TradingMode.PAPER,
+                required_migration_profile=(
+                    MigrationProfile.CONTROLLED_RUNTIME
+                    if self.settings.trading_mode is TradingMode.PAPER
+                    else None
+                ),
+            )
         )
         self.pipeline = RiskPipeline(self.settings)
         self.paper_pipeline = PaperRiskPipeline(self.settings)
         self.paper = PaperRiskCoordinator(self.settings, self.paper_pipeline)
         self.paper_canary_repository = paper_canary_repository or RejectAllPaperCanaryArmRepository()
         self._paper_canary_repository_explicit = paper_canary_repository is not None
+        self.paper_operator_repository = paper_operator_repository or RejectAllPaperOperatorRepository()
+        self._paper_operator_repository_explicit = paper_operator_repository is not None
+        self._paper_operator_scope: CanaryScope | None = None
+        if self.settings.trading_mode is TradingMode.PAPER:
+            try:
+                self._paper_operator_scope = load_operator_scope(self.settings, paper_operator_scope)
+            except (OSError, ValueError, TypeError):
+                # No file contents, paths or arbitrary exception text in logs.
+                self._paper_operator_scope = None
         self.breakers = CircuitBreakerRegistry(
             self.settings.breaker_max_consecutive_failures,
             self.settings.breaker_cooldown_s,
@@ -291,7 +318,16 @@ class RiskService:
             await self.paper.wait_for_inputs(review, now_ms=self._now_ms)
             observed_now_ms = self._now_ms()
             decided_at_ms = observed_now_ms
-            if is_canary and not canary_arm_checked:
+            operator: OperatorSnapshotV1 | None = None
+            try:
+                if self._paper_operator_scope is None:
+                    raise ValueError("operator scope is unavailable")
+                operator = await self.paper_operator_repository.snapshot(self._paper_operator_scope)
+            except Exception:
+                admission_rejections = tuple(
+                    sorted(set((*admission_rejections, "operator_control_unavailable")))
+                )
+            if is_canary and not canary_arm_checked and operator is not None:
                 arm = await self.paper_canary_repository.consume(
                     account_id=self.settings.paper_account_id,
                     review=review,
@@ -321,6 +357,25 @@ class RiskService:
                     system_mode=self.breakers.system_mode,
                     admission_rejection_reasons=admission_rejections,
                 )
+                if decision.approved:
+                    try:
+                        if operator is None or self._paper_operator_scope is None:
+                            raise ValueError("operator admission is unavailable")
+                        await self.paper_operator_repository.bind_decision(
+                            decision=decision,
+                            expected_scope=self._paper_operator_scope,
+                            expected_version=operator.version,
+                        )
+                    except Exception:
+                        # External authority revokes even a cached approval. Existing
+                        # reservations remain conservative until authoritative expiry.
+                        decision = await self.paper.evaluate(
+                            review,
+                            allocation=canary_allocation if is_canary else self.strategic_allocation,
+                            decided_at_ms=decided_at_ms,
+                            system_mode=self.breakers.system_mode,
+                            admission_rejection_reasons=("operator_control_changed",),
+                        )
                 break
             except PaperInputUnavailable:
                 # A same-tick account/venue conflict can revoke authority after
@@ -613,6 +668,8 @@ class RiskService:
         if not isinstance(self.bus, DurableMessageBus):
             raise RuntimeError("PAPER recovery requires DurableMessageBus")
         await self.bus.start()
+        if not self._paper_operator_repository_explicit:
+            self.paper_operator_repository = OperatorControlRepository(self.bus.database.pool)
         if not self._paper_canary_repository_explicit:
             self.paper_canary_repository = build_persistence_canary_repository(self.bus.database.pool)
         recovered_at_ms = self._now_ms()

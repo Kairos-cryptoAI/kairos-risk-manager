@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from kairos_core.bus import BusEnvelope
-from kairos_core.contracts import CandidateReviewV1, OpenOrderSnapshotV2
+from kairos_core.contracts import CandidateReviewV1, OpenOrderSnapshotV2, canonical_sha256
 from kairos_core.enums import (
     MarketRegime,
     OrderRole,
@@ -20,6 +20,8 @@ from kairos_core.enums import (
     TradingMode,
 )
 from kairos_core.topics import Topics
+from kairos_persistence.canary_session import CanaryScope
+from kairos_persistence.operator_control import OperatorAdmissionV1, OperatorSnapshotV1
 
 from kairos_risk.canary import CanaryInputs, CanaryPlan, prepare_canary
 from kairos_risk.canary_authorization import (
@@ -44,6 +46,47 @@ from tests.test_paper import (
     _venue,
 )
 from tests.test_service import FakeBus
+
+
+class LayeredOperatorAdmission:
+    """Explicit frozen-clock lifecycle fixture; NOT durable operator evidence."""
+
+    async def snapshot(self, expected_scope):
+        return OperatorSnapshotV1(
+            scope=expected_scope,
+            version=1,
+            state="ARMED",
+            session_id="1" * 64,
+            expires_at_ms=NOW + 7_200_000,
+            audit_head_sha256="2" * 64,
+        )
+
+    async def bind_decision(self, *, decision, expected_scope, expected_version):
+        return OperatorAdmissionV1(
+            scope_sha256=canonical_sha256(expected_scope.model_dump(mode="json")),
+            control_version=expected_version,
+            session_id="1" * 64,
+            decision_id=decision.decision_id,
+            decision_sha256=canonical_sha256(decision.model_dump(mode="json")),
+            trade_id=decision.trade_id,
+            expires_at_ms=decision.intent.entry_expires_ts_ms,
+        )
+
+
+def _layered_operator_service(settings, **kwargs):
+    # Existing canary/recovery tests keep their subject; missing-default tests
+    # construct the real RiskService directly in test_operator_control.py.
+    settings = settings.model_copy(update={"environment": "paper-dev"})
+    scope = CanaryScope(
+        environment="paper-dev",
+        account_id=settings.paper_account_id,
+        remote_account_id="synthetic-risk-fixture",
+        config_sha256="a" * 64,
+        recorder_code_sha256="b" * 64,
+    )
+    return RiskService(
+        settings, paper_operator_scope=scope, paper_operator_repository=LayeredOperatorAdmission(), **kwargs
+    )
 
 
 def _envelope(topic: str, message: object, *, envelope_id: str = "paper-1") -> BusEnvelope:
@@ -285,7 +328,7 @@ def test_retired_false_dry_run_environment_flag_fails_startup(monkeypatch) -> No
 async def test_service_publishes_decision_before_acknowledging_review() -> None:
     review, arm = _armed_canary()
     repository = FakeCanaryArmRepository(arm)
-    service = RiskService(_settings(), paper_canary_repository=repository)
+    service = _layered_operator_service(_settings(), paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())
@@ -311,7 +354,7 @@ async def test_service_publishes_decision_before_acknowledging_review() -> None:
 @pytest.mark.asyncio
 async def test_service_review_wakes_immediately_when_venue_quality_arrives() -> None:
     review, arm = _armed_canary()
-    service = RiskService(
+    service = _layered_operator_service(
         _settings(),
         paper_canary_repository=FakeCanaryArmRepository(arm),
     )
@@ -341,7 +384,7 @@ async def test_service_review_wakes_immediately_when_venue_quality_arrives() -> 
 async def test_direct_bus_canary_allow_without_durable_arm_is_explicitly_rejected() -> None:
     review, _arm = _armed_canary()
     repository = FakeCanaryArmRepository(None)
-    service = RiskService(_settings(), paper_canary_repository=repository)
+    service = _layered_operator_service(_settings(), paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())
@@ -367,7 +410,7 @@ async def test_direct_bus_canary_allow_without_durable_arm_is_explicitly_rejecte
 async def test_invalid_durable_canary_arm_is_rejected_and_review_is_acknowledged() -> None:
     review, arm = _armed_canary()
     repository = FakeCanaryArmRepository(replace(arm, status="ARMED"))
-    service = RiskService(_settings(), paper_canary_repository=repository)
+    service = _layered_operator_service(_settings(), paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())
@@ -391,7 +434,7 @@ async def test_invalid_durable_canary_arm_is_rejected_and_review_is_acknowledged
 async def test_missing_arm_cannot_reuse_an_approved_in_process_cache_entry() -> None:
     review, arm = _armed_canary()
     repository = FakeCanaryArmRepository(arm)
-    service = RiskService(_settings(), paper_canary_repository=repository)
+    service = _layered_operator_service(_settings(), paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())
@@ -417,7 +460,7 @@ async def test_missing_arm_cannot_reuse_an_approved_in_process_cache_entry() -> 
 async def test_consumed_arm_and_decision_replay_identically_after_risk_restart() -> None:
     review, arm = _armed_canary()
     first_repository = FakeCanaryArmRepository(arm)
-    first_service = RiskService(_settings(), paper_canary_repository=first_repository)
+    first_service = _layered_operator_service(_settings(), paper_canary_repository=first_repository)
     await first_service.paper.restore_reservations(())
     await first_service.paper.apply_account(_account())
     await first_service.paper.apply_venue(_venue())
@@ -429,7 +472,7 @@ async def test_consumed_arm_and_decision_replay_identically_after_risk_restart()
     assert first_decision.approved
 
     replay_repository = FakeCanaryArmRepository(arm)
-    restarted = RiskService(_settings(), paper_canary_repository=replay_repository)
+    restarted = _layered_operator_service(_settings(), paper_canary_repository=replay_repository)
     await restarted.paper.restore_reservations((first_decision,))
     await restarted.paper.apply_account(_account(reconciliation_seq=2))
     await restarted.paper.apply_venue(_venue())
@@ -450,7 +493,7 @@ async def test_consumed_arm_and_decision_replay_identically_after_risk_restart()
 async def test_generic_promoted_strategy_keeps_macro_allocation_path_and_never_claims_canary_arm() -> None:
     repository = FakeCanaryArmRepository(None)
     settings = _settings(paper_strategy_allowlist=["promoted-alpha@1"])
-    service = RiskService(settings, paper_canary_repository=repository)
+    service = _layered_operator_service(settings, paper_canary_repository=repository)
     await service.paper.restore_reservations(())
     await service.paper.apply_account(_account())
     await service.paper.apply_venue(_venue())

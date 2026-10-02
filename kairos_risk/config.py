@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType
 
 from kairos_core.config import CoreSettings
@@ -66,6 +67,7 @@ class RiskSettings(CoreSettings):
     # copied into this allowlist.
     paper_strategy_allowlist: list[str] = Field(default_factory=list)
     paper_account_id: str = "kairos-paper-dev-01"
+    paper_operator_scope_file: Path | None = None
     paper_account_snapshot_max_age_s: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     paper_per_trade_risk_fraction: float = Field(
         default=0.0025,

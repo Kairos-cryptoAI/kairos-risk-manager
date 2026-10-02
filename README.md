@@ -358,4 +358,25 @@ through `kairos-persistence`; Redis is ACKed only after PostgreSQL commits.
 Configure `KAIROS_PERSISTENCE_DATABASE_URL` through the deployment secret
 provider. The in-memory backend intentionally bypasses persistence for tests.
 
+## Durable operator entry admission
+
+PAPER now requires an independently prepared, explicitly selected
+`controlled-runtime` persistence profile. Startup verifies schema and separated
+runtime/operator/owner roles without automatic migration. Configure the bounded
+independent public scope JSON with `KAIROS_PAPER_OPERATOR_SCOPE_FILE`; it
+must exactly match environment/account and existing canary scope. Neither a
+config boolean nor an operator label grants entry authority.
+
+Every new PAPER review reads the durable account-wide operator fence. Missing,
+expired, killed or unavailable authority denies before consuming a canary arm;
+approved decisions are immutably bound to the same control version before
+publication. A concurrent operator change refuses publication, retaining any
+existing reservation conservatively. Existing canary, deterministic sizing,
+0.25% per-trade / 1% aggregate ceilings and recovery gates are unchanged.
+Protective exits remain Execution's separate recovery responsibility.
+
+Unit-only layered fixtures explicitly supply operator admission solely to test
+legacy lifecycle behavior; defaults remain refusal. These tests neither prepare
+a working database nor qualify PAPER/LIVE.
+
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
