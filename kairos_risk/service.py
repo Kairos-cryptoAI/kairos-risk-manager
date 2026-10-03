@@ -7,7 +7,8 @@ import json
 import time
 from datetime import UTC, datetime
 
-from kairos_core.bus import BusEnvelope, build_bus
+from kairos_core.bus import BusEnvelope, MessageBus, build_bus
+from kairos_core.bus.redis_streams import RedisStreamsBus
 from kairos_core.contracts import (
     AccountSnapshot,
     AccountSnapshotV2,
@@ -73,26 +74,42 @@ class RiskService:
         self,
         settings: RiskSettings | None = None,
         *,
+        bus: MessageBus | None = None,
         paper_canary_repository: PaperCanaryArmRepository | None = None,
         paper_operator_repository: PaperOperatorRepository | None = None,
         paper_operator_scope: CanaryScope | None = None,
     ) -> None:
         self.settings = settings or RiskSettings()
-        transport = build_bus(self.settings)
-        self.bus = (
-            transport
-            if self.settings.bus_backend == "memory"
-            else DurableMessageBus(
-                transport,
-                service_name=self.settings.service_name,
-                verify_schema_only=self.settings.trading_mode is TradingMode.PAPER,
-                required_migration_profile=(
-                    MigrationProfile.CONTROLLED_RUNTIME
-                    if self.settings.trading_mode is TradingMode.PAPER
-                    else None
-                ),
+        if bus is not None:
+            if self.settings.trading_mode is TradingMode.PAPER and (
+                not isinstance(bus, DurableMessageBus)
+                or not isinstance(bus.transport, RedisStreamsBus)
+                or bus.service_name != self.settings.service_name
+                or not bus.verify_schema_only
+                or bus.required_migration_profile is not MigrationProfile.CONTROLLED_RUNTIME
+                or bus.database.migration_profile is not MigrationProfile.CONTROLLED_RUNTIME
+            ):
+                raise ValueError(
+                    "PAPER injected bus requires exact Redis identity "
+                    "and verify-only controlled-runtime schema"
+                )
+            self.bus = bus
+        else:
+            transport = build_bus(self.settings)
+            self.bus = (
+                transport
+                if self.settings.bus_backend == "memory"
+                else DurableMessageBus(
+                    transport,
+                    service_name=self.settings.service_name,
+                    verify_schema_only=self.settings.trading_mode is TradingMode.PAPER,
+                    required_migration_profile=(
+                        MigrationProfile.CONTROLLED_RUNTIME
+                        if self.settings.trading_mode is TradingMode.PAPER
+                        else None
+                    ),
+                )
             )
-        )
         self.pipeline = RiskPipeline(self.settings)
         self.paper_pipeline = PaperRiskPipeline(self.settings)
         self.paper = PaperRiskCoordinator(self.settings, self.paper_pipeline)

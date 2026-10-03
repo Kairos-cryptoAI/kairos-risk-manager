@@ -3,10 +3,14 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from kairos_core.bus import InMemoryBus
+from kairos_core.bus.redis_streams import RedisStreamsBus
 from kairos_core.topics import Topics
+from kairos_persistence import Database, DurableMessageBus, MigrationProfile, PersistenceSettings
 from kairos_persistence.operator_control import OperatorControlRefused
 
-from kairos_risk.operator_control import load_operator_scope
+from kairos_risk.config import RiskSettings
+from kairos_risk.operator_control import RejectAllPaperOperatorRepository, load_operator_scope
 from kairos_risk.service import RiskService
 from tests.test_paper import NOW, _account, _settings, _venue
 from tests.test_paper_runtime import (
@@ -17,6 +21,79 @@ from tests.test_paper_runtime import (
     _layered_operator_service,
 )
 from tests.test_service import FakeBus
+
+
+def test_explicit_dry_run_bus_avoids_default_transport(monkeypatch):
+    def forbidden(_settings):
+        raise AssertionError("Default transport must not be constructed")
+
+    monkeypatch.setattr("kairos_risk.service.build_bus", forbidden)
+    bus = InMemoryBus()
+    service = RiskService(RiskSettings(_env_file=None, bus_backend="memory"), bus=bus)
+    assert service.bus is bus
+    assert isinstance(service.paper_operator_repository, RejectAllPaperOperatorRepository)
+
+
+def _injected_paper_bus(
+    *,
+    verify=True,
+    required=MigrationProfile.CONTROLLED_RUNTIME,
+    profile=MigrationProfile.CONTROLLED_RUNTIME,
+    transport=None,
+    service_name="fixture-risk",
+):
+    settings = PersistenceSettings(
+        _env_file=None, database_url="postgresql://fixture:fixture@fixture.invalid:5432/kairos"
+    )
+    return DurableMessageBus(
+        transport or RedisStreamsBus("redis://fixture.invalid:6379/0"),
+        service_name=service_name,
+        settings=settings,
+        database=Database(settings, migration_profile=profile),
+        verify_schema_only=verify,
+        required_migration_profile=required,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["memory", "memory-transport", "wrong-identity", "migrating", "no-required-profile", "wrong-profile"],
+)
+def test_injected_paper_bus_cannot_bypass_controlled_schema(kind):
+    bus = {
+        "memory": lambda: InMemoryBus(),
+        "memory-transport": lambda: _injected_paper_bus(transport=InMemoryBus()),
+        "wrong-identity": lambda: _injected_paper_bus(service_name="other-service"),
+        "migrating": lambda: _injected_paper_bus(verify=False),
+        "no-required-profile": lambda: _injected_paper_bus(required=None),
+        "wrong-profile": lambda: _injected_paper_bus(profile=MigrationProfile.RUNTIME),
+    }[kind]()
+    with pytest.raises(ValueError, match="verify-only controlled-runtime"):
+        RiskService(
+            RiskSettings(
+                _env_file=None, service_name="fixture-risk", trading_mode="PAPER", bus_backend="redis"
+            ),
+            bus=bus,
+        )
+
+
+@pytest.mark.asyncio
+async def test_valid_explicit_paper_bus_preserves_runtime_start_and_default_operator_deny(monkeypatch):
+    bus = _injected_paper_bus()
+    service = RiskService(
+        RiskSettings(_env_file=None, service_name="fixture-risk", trading_mode="PAPER", bus_backend="redis"),
+        bus=bus,
+    )
+    assert service.bus is bus and not service.paper.recovery_complete
+    assert isinstance(service.paper_operator_repository, RejectAllPaperOperatorRepository)
+    assert service._paper_operator_scope is None
+    assert service.settings.paper_strategy_allowlist == []
+    start = AsyncMock(side_effect=RuntimeError("FIXTURE_START_REFUSED"))
+    monkeypatch.setattr(bus, "start", start)
+    with pytest.raises(RuntimeError, match="FIXTURE_START_REFUSED"):
+        await service._recover_paper_state()
+    start.assert_awaited_once()
+    assert not service.paper.recovery_complete
 
 
 async def ready(service):
