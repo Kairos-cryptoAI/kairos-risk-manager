@@ -167,9 +167,9 @@ class RiskService:
         inferred_provider = self.breakers.infer_provider(model)
         resolved_provider = provider or inferred_provider
         # A success attributed to the wrong provider cannot prove that a
-        # current model route recovered, even at the model level.
+        # known model route recovered, even at the model level.
         if (
-            model in self.breakers.CURRENT_MODELS
+            model in self.breakers.KNOWN_MODELS
             and resolved_provider
             and self.breakers.normalize_provider(resolved_provider) != inferred_provider
         ):

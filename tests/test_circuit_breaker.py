@@ -112,11 +112,23 @@ def test_unknown_model_outage_fails_closed():
     assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
 
 
-def test_historical_model_outages_fail_closed():
+def test_current_models_match_fixed_gateway_default_routes():
+    assert CircuitBreakerRegistry.CURRENT_MODELS == {"gpt-6-luna", "gpt-6.1-sol"}
+    assert "gpt-6-sol" in CircuitBreakerRegistry.LEGACY_MODELS
+    assert CircuitBreakerRegistry.FLASH in CircuitBreakerRegistry.LEGACY_MODELS
+    assert CircuitBreakerRegistry.CURRENT_MODELS.isdisjoint(CircuitBreakerRegistry.LEGACY_MODELS)
+
+
+def test_historical_model_outages_keep_existing_degraded_modes():
     for model in CircuitBreakerRegistry.LEGACY_MODELS:
         reg = CircuitBreakerRegistry(max_consecutive_failures=2)
         _trip(reg, model)
-        assert reg.system_mode is SystemMode.LOCAL_QUANT_MODE
+        expected = (
+            SystemMode.TEXT_LOCAL_FILTER
+            if model == CircuitBreakerRegistry.FLASH
+            else SystemMode.LOCAL_QUANT_MODE
+        )
+        assert reg.system_mode is expected
 
 
 def test_legacy_gpt_alias_still_targets_sol():
@@ -159,6 +171,7 @@ def test_provider_inference_covers_current_and_future_model_families():
         CircuitBreakerRegistry.TERRA: "openai",
         CircuitBreakerRegistry.SOL: "openai",
         CircuitBreakerRegistry.LEGACY_SOL: "openai",
+        CircuitBreakerRegistry.LEGACY_SOL_6: "openai",
         "gpt-6-future": "openai",
         "unknown-model": None,
     }

@@ -165,7 +165,7 @@ def _trip(registry: CircuitBreakerRegistry, model: str) -> None:
     ("model", "expected_mode"),
     [
         ("gpt-6-luna", SystemMode.LOCAL_QUANT_MODE),
-        ("gpt-6-sol", SystemMode.LOCAL_QUANT_MODE),
+        ("gpt-6.1-sol", SystemMode.LOCAL_QUANT_MODE),
     ],
 )
 def test_openai_model_outages_drive_expected_mode(model, expected_mode):
@@ -203,7 +203,7 @@ def test_healthy_signal_recovers_to_normal():
     service = _service()
     _trip(service.breakers, CircuitBreakerRegistry.SOL)
     assert service.breakers.system_mode is SystemMode.LOCAL_QUANT_MODE
-    service.apply_health_event(model="gpt-6-sol", ok=True)
+    service.apply_health_event(model="gpt-6.1-sol", ok=True)
     assert service.breakers.system_mode is SystemMode.NORMAL
 
 
@@ -222,7 +222,7 @@ def test_wrong_provider_success_cannot_recover_current_model():
 @pytest.mark.parametrize("kind", ["connection", "rate_limit"])
 def test_openai_provider_outage_drives_local_quant_mode(kind):
     service = _service()
-    models = ("gpt-6-luna", "gpt-6-sol", "gpt-6-luna")
+    models = ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-luna")
     for model in models:
         service.apply_health_event(model=model, provider="openai", ok=False, kind=kind)
 
@@ -231,10 +231,10 @@ def test_openai_provider_outage_drives_local_quant_mode(kind):
 
 def test_healthy_openai_signal_resets_aggregate_provider_streak():
     service = _service()
-    for model in ("gpt-6-luna", "gpt-6-sol"):
+    for model in ("gpt-6-luna", "gpt-6.1-sol"):
         service.apply_health_event(model=model, provider="openai", ok=False, kind="connection")
     service.apply_health_event(model="gpt-6-luna", provider="openai", ok=True)
-    for model in ("gpt-6-luna", "gpt-6-sol"):
+    for model in ("gpt-6-luna", "gpt-6.1-sol"):
         service.apply_health_event(model=model, provider="openai", ok=False, kind="connection")
 
     assert service.breakers.is_provider_down("openai") is False
@@ -254,12 +254,32 @@ def test_openai_success_recovers_provider_but_not_sibling_model():
     assert service.breakers.system_mode is SystemMode.LOCAL_QUANT_MODE
 
 
+@pytest.mark.parametrize("provider", [None, "openai", " OpenAI "])
+def test_current_sol_success_recovers_its_model_and_provider(provider):
+    service = _service()
+    for _ in range(3):
+        service.apply_health_event(model="gpt-6.1-sol", provider=provider, ok=False, kind="connection")
+
+    assert service.breakers.is_down("gpt-6.1-sol") is True
+    assert service.breakers.is_provider_down("openai") is True
+    assert service.breakers.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+    service.apply_health_event(model="gpt-6.1-sol", provider=provider, ok=True)
+
+    assert service.breakers.is_down("gpt-6.1-sol") is False
+    assert service.breakers.is_provider_down("openai") is False
+    assert service.breakers.system_mode is SystemMode.NORMAL
+
+
 @pytest.mark.parametrize(
     ("model", "provider"),
     [
         (CircuitBreakerRegistry.LEGACY_SOL, "openai"),
+        ("gpt-6-sol", "openai"),
         ("gpt-6-unknown", "openai"),
+        ("unknown-model", "openai"),
         (CircuitBreakerRegistry.FLASH, "openai"),
+        ("gpt-6.1-sol", "deepseek"),
     ],
 )
 def test_obsolete_unknown_or_wrong_provider_success_cannot_clear_outage(model, provider):
@@ -275,9 +295,45 @@ def test_obsolete_unknown_or_wrong_provider_success_cannot_clear_outage(model, p
     assert service.breakers.system_mode is SystemMode.NORMAL
 
 
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("gpt-6-sol", None),
+        (CircuitBreakerRegistry.LEGACY_SOL, "openai"),
+        ("gpt-6-unknown", "openai"),
+        ("unknown-model", "openai"),
+        (CircuitBreakerRegistry.FLASH, "deepseek"),
+        ("gpt-6.1-sol", "deepseek"),
+    ],
+)
+def test_non_current_or_foreign_success_does_not_reset_provider_failure_streak(model, provider):
+    service = _service()
+    for current_model in ("gpt-6-luna", "gpt-6.1-sol"):
+        service.apply_health_event(model=current_model, provider="openai", ok=False, kind="connection")
+
+    service.apply_health_event(model=model, provider=provider, ok=True)
+    service.apply_health_event(model="gpt-6-luna", provider="openai", ok=False, kind="connection")
+
+    assert service.breakers.is_provider_down("openai") is True
+    assert service.breakers.system_mode is SystemMode.LOCAL_QUANT_MODE
+
+
+@pytest.mark.parametrize("model", ["deepseek-flash", "gpt-6-sol"])
+def test_wrong_provider_success_cannot_recover_known_legacy_model(model):
+    service = _service()
+    _trip(service.breakers, model)
+    foreign_provider = "openai" if model == "deepseek-flash" else "deepseek"
+
+    service.apply_health_event(model=model, provider=foreign_provider, ok=True)
+
+    assert service.breakers.is_down(model) is True
+    service.apply_health_event(model=model, ok=True)
+    assert service.breakers.is_down(model) is False
+
+
 def test_deepseek_success_does_not_reset_openai_provider_streak():
     service = _service()
-    for model in ("gpt-6-luna", "gpt-6-sol"):
+    for model in ("gpt-6-luna", "gpt-6.1-sol"):
         service.apply_health_event(model=model, provider="openai", ok=False, kind="connection")
     service.apply_health_event(model="deepseek-flash", provider="deepseek", ok=True)
     service.apply_health_event(
@@ -293,7 +349,7 @@ def test_deepseek_success_does_not_reset_openai_provider_streak():
 
 def test_explicit_provider_is_normalized_and_wins_over_inference():
     normalized = _service()
-    for model in ("gpt-6-luna", "gpt-6-sol", "gpt-6-luna"):
+    for model in ("gpt-6-luna", "gpt-6.1-sol", "gpt-6-luna"):
         normalized.apply_health_event(
             model=model,
             provider=" OpenAI ",
@@ -305,7 +361,7 @@ def test_explicit_provider_is_normalized_and_wins_over_inference():
     explicit = _service()
     for _ in range(3):
         explicit.apply_health_event(
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             provider="deepseek",
             ok=False,
             kind="connection",
@@ -317,7 +373,7 @@ def test_explicit_provider_is_normalized_and_wins_over_inference():
 def test_provider_is_inferred_when_health_event_omits_provider():
     service = _service()
     for _ in range(3):
-        service.apply_health_event(model="gpt-6-sol", ok=False, kind="connection")
+        service.apply_health_event(model="gpt-6.1-sol", ok=False, kind="connection")
 
     assert service.breakers.is_provider_down("openai") is True
     assert service.breakers.system_mode is SystemMode.LOCAL_QUANT_MODE
@@ -353,12 +409,47 @@ async def test_health_consumer_uses_event_provider_for_aggregate_outage():
     assert [ack[1] for ack in bus.acks] == ["health-0", "health-1", "health-2"]
 
 
+@pytest.mark.asyncio
+async def test_current_sol_health_consumer_recovers_and_broadcasts_mode():
+    events = [
+        LLMHealthEvent(
+            source="macro",
+            provider="openai",
+            model="gpt-6.1-sol",
+            ok=ok,
+            kind="ok" if ok else "connection",
+        )
+        for ok in (False, False, False, True)
+    ]
+    bus = FakeBus(
+        {
+            Topics.LLM_HEALTH: [
+                _envelope(Topics.LLM_HEALTH, event, envelope_id=f"health-{index}")
+                for index, event in enumerate(events)
+            ]
+        }
+    )
+    service = _service()
+    service.bus = bus
+
+    await service._consume_health()
+
+    assert [message.mode for topic, message in bus.published if topic == Topics.SYSTEM_CONTROL] == [
+        SystemMode.LOCAL_QUANT_MODE,
+        SystemMode.NORMAL,
+    ]
+    assert service.breakers.is_provider_down("openai") is False
+    assert service.breakers.is_down("gpt-6.1-sol") is False
+    assert service.breakers.system_mode is SystemMode.NORMAL
+    assert [ack[1] for ack in bus.acks] == ["health-0", "health-1", "health-2", "health-3"]
+
+
 @pytest.mark.parametrize("kind", ["error", "bad_output", "http_4xx", "conflict"])
 def test_non_outage_failure_does_not_trip_breaker(kind):
     service = _service()
     for _ in range(5):
         service.apply_health_event(
-            model="gpt-6-sol",
+            model="gpt-6.1-sol",
             provider="openai",
             ok=False,
             kind=kind,
@@ -772,7 +863,7 @@ async def test_mode_publish_failure_is_retryable_and_health_stays_pending():
     event = LLMHealthEvent(
         source="aggregator",
         provider="openai",
-        model="gpt-6-sol",
+        model="gpt-6.1-sol",
         ok=False,
         kind="5xx",
     )

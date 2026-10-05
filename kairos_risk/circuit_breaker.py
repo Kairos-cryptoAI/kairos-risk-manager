@@ -82,23 +82,26 @@ class CircuitBreakerRegistry:
 
     FLASH = "deepseek-flash"
     LUNA = "gpt-6-luna"
-    SOL = "gpt-6-sol"
+    SOL = "gpt-6.1-sol"
     OPENAI = "openai"
 
-    # Keep historical event identities available, but never treat an outage
-    # from an obsolete route as an outage of a current, independently safe role.
+    # Keep historical and explicit opt-in event identities available. Their
+    # successful calls cannot recover an aggregate current-provider outage.
     LEGACY_FLASH = "deepseek-v4-flash"
     LEGACY_LUNA = "gpt-5.6-luna"
     TERRA = "gpt-5.6-terra"
     LEGACY_SOL = "gpt-5.6-sol"
+    LEGACY_SOL_6 = "gpt-6-sol"
 
     # Backwards-compatible role name used by older callers and tests.
     GPT = SOL
 
-    CURRENT_MODELS = frozenset((FLASH, LUNA, SOL))
-    LEGACY_MODELS = frozenset((LEGACY_FLASH, LEGACY_LUNA, TERRA, LEGACY_SOL))
+    # Match the central gateway's fixed DEFAULT_WORKLOAD_ROUTES without a
+    # runtime dependency on the LLM package or provider discovery.
+    CURRENT_MODELS = frozenset((LUNA, SOL))
+    LEGACY_MODELS = frozenset((FLASH, LEGACY_FLASH, LEGACY_LUNA, TERRA, LEGACY_SOL, LEGACY_SOL_6))
     KNOWN_MODELS = CURRENT_MODELS | LEGACY_MODELS
-    OPENAI_MODELS = frozenset((LUNA, SOL, LEGACY_LUNA, TERRA, LEGACY_SOL))
+    OPENAI_MODELS = frozenset((LUNA, SOL, LEGACY_LUNA, TERRA, LEGACY_SOL, LEGACY_SOL_6))
 
     def __init__(self, max_consecutive_failures: int = 2, cooldown_s: float = 300.0) -> None:
         self._max = max_consecutive_failures

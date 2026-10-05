@@ -171,14 +171,19 @@ publishes changes on `kairos.system.control`. It deliberately does not subscribe
 own control stream; command validation reads the same authoritative breaker registry
 that produced the broadcast.
 
-The current health registry tracks `deepseek-flash`, `gpt-6-luna`, and `gpt-6-sol`.
-The Sol route serves both conflict aggregation and Macro allocation. A Flash-only
-outage selects `TEXT_LOCAL_FILTER`; a Luna or Sol outage selects fail-closed
-`LOCAL_QUANT_MODE`. An unavailable historical model ID, an unknown model ID, or an
+The current health registry matches the fixed central gateway defaults:
+`gpt-6-luna` and `gpt-6.1-sol`, both OpenAI. The Sol route serves both conflict
+aggregation and Macro allocation. `gpt-6-sol` and `deepseek-flash` remain explicit
+legacy identities, not current default routes. A Flash-only outage keeps the
+historical `TEXT_LOCAL_FILTER` behavior; a Luna or Sol outage selects fail-closed
+`LOCAL_QUANT_MODE`. Any other unavailable historical model ID, an unknown model ID, or an
 aggregated OpenAI connection/rate-limit outage also selects `LOCAL_QUANT_MODE`.
-Successful calls recover only the named model; only a current model can recover
-its provider aggregate. Bad output and permanent HTTP/client errors remain visible
-health failures but do not represent an availability outage.
+Successful calls recover only the named model; only a current model with the
+matching provider can recover its provider aggregate. Unknown or legacy model
+success cannot reset the current provider outage or its failure streak, and a
+wrong-provider success cannot recover a known model. Bad output and permanent
+HTTP/client errors remain visible health failures but do not represent an
+availability outage.
 
 ## PAPER loss-at-stop sizing
 
