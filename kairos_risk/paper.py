@@ -11,6 +11,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC
+from typing import TYPE_CHECKING
 
 from kairos_core.contracts import (
     AccountSnapshotV2,
@@ -18,6 +19,7 @@ from kairos_core.contracts import (
     PositionSnapshotV2,
     RiskTradeDecisionV1,
     StrategicAllocation,
+    StrategyIntentV1,
     VenueQualityV1,
 )
 from kairos_core.enums import (
@@ -34,6 +36,9 @@ from kairos_core.enums import (
 from .canary_instrument import bound_canary_quantity
 from .config import PAPER_CANARY_STRATEGY_ID, PAPER_DEV_SYMBOL_MAP, RiskSettings
 from .strategy import allocation_error
+
+if TYPE_CHECKING:
+    from kairos_core.contracts.regime_capability import RegimeBoundAllocationV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +87,7 @@ class PaperRiskPipeline:
 
     def __init__(self, settings: RiskSettings | None = None) -> None:
         self.settings = settings or RiskSettings()
+        self.regime_policy = self.settings.load_regime_policy()
 
     def evaluate(
         self,
@@ -94,6 +100,7 @@ class PaperRiskPipeline:
         system_mode: SystemMode = SystemMode.NORMAL,
         reservations: PaperReservations | None = None,
         admission_rejection_reasons: tuple[str, ...] = (),
+        regime_allocation: RegimeBoundAllocationV1 | None = None,
     ) -> RiskTradeDecisionV1:
         """Return an approved or explicit rejected ``RiskTradeDecisionV1``.
 
@@ -152,12 +159,21 @@ class PaperRiskPipeline:
         )
         reasons.extend(account_reasons)
 
-        allocation_reasons, allocation_metrics = self._allocation_gate(
-            allocation,
-            strategy_id=intent.strategy_id,
-            side=intent.side,
-            decided_at_ms=decided_at_ms,
-        )
+        adaptive = self.regime_policy is not None and intent.strategy_id != PAPER_CANARY_STRATEGY_ID
+        if adaptive:
+            allocation_reasons, allocation_metrics = self._adaptive_allocation_gate(
+                regime_allocation,
+                intent=intent,
+                account=account,
+                decided_at_ms=decided_at_ms,
+            )
+        else:
+            allocation_reasons, allocation_metrics = self._allocation_gate(
+                allocation,
+                strategy_id=intent.strategy_id,
+                side=intent.side,
+                decided_at_ms=decided_at_ms,
+            )
         reasons.extend(allocation_reasons)
 
         worst_entry = venue.best_ask if intent.side is Side.LONG else venue.best_bid
@@ -250,7 +266,11 @@ class PaperRiskPipeline:
         return RiskTradeDecisionV1(
             source=self.settings.service_name,
             correlation_id=intent.intent_id,
-            causation_id=review.message_id,
+            causation_id=(
+                regime_allocation.message_id
+                if adaptive and regime_allocation is not None and not allocation_reasons
+                else review.message_id
+            ),
             intent=intent,
             review=review,
             venue_quality=venue,
@@ -380,6 +400,7 @@ class PaperRiskPipeline:
         strategy_id: str,
         side: Side,
         decided_at_ms: int,
+        enforce_legacy_regime: bool = True,
     ) -> tuple[list[str], _AllocationMetrics | None]:
         if allocation is None:
             return ["strategic_allocation_missing"], None
@@ -402,11 +423,11 @@ class PaperRiskPipeline:
         strategy_weight = allocation.strategy_weights.get(strategy_id, 0.0)
         if strategy_weight <= 0:
             reasons.append("strategy_has_no_macro_allocation")
-        if allocation.regime is MarketRegime.CHOP:
+        if enforce_legacy_regime and allocation.regime is MarketRegime.CHOP:
             reasons.append("macro_regime_chop")
-        elif allocation.regime is MarketRegime.BEAR and side is Side.LONG:
+        elif enforce_legacy_regime and allocation.regime is MarketRegime.BEAR and side is Side.LONG:
             reasons.append("macro_regime_forbids_long")
-        elif allocation.regime is MarketRegime.BULL and side is Side.SHORT:
+        elif enforce_legacy_regime and allocation.regime is MarketRegime.BULL and side is Side.SHORT:
             reasons.append("macro_regime_forbids_short")
 
         return reasons, _AllocationMetrics(
@@ -414,6 +435,54 @@ class PaperRiskPipeline:
             stable_reserve_fraction=allocation.stable_reserve_pct,
             strategy_weight=strategy_weight,
             max_gross_leverage=allocation.max_gross_leverage,
+        )
+
+    def _adaptive_allocation_gate(
+        self,
+        allocation: RegimeBoundAllocationV1 | None,
+        *,
+        intent: StrategyIntentV1,
+        account: AccountSnapshotV2 | None,
+        decided_at_ms: int,
+    ) -> tuple[list[str], _AllocationMetrics | None]:
+        if allocation is None:
+            return ["regime_bound_allocation_missing"], None
+        from kairos_core.contracts.regime_capability import RegimeBoundAllocationV1
+
+        try:
+            # Pydantic model_copy() deliberately bypasses validators; reparse
+            # the entire closed envelope at this admission boundary as well.
+            allocation = RegimeBoundAllocationV1.model_validate_json(allocation.model_dump_json())
+            if self.regime_policy is None:
+                raise ValueError("adaptive regime policy is not enabled")
+            basis, observation = allocation.capital_basis, allocation.observation
+            self.regime_policy.validate_observation(observation)
+            if basis.policy_sha256 != self.regime_policy.policy_sha256:
+                raise ValueError("capital policy mismatch")
+            if observation.intent.model_dump(mode="json") != intent.model_dump(mode="json"):
+                raise ValueError("foreign immutable intent")
+            if allocation.source != self.settings.paper_regime_macro_source:
+                raise ValueError("foreign Macro producer")
+            if (
+                basis.account_id != self.settings.paper_account_id
+                or account is None
+                or basis.account_id != account.account_id
+            ):
+                raise ValueError("foreign account scope")
+            if basis.account_captured_at_ms > intent.decision_ts_ms:
+                raise ValueError("future capital account")
+            if not allocation.bound_at_ms <= decided_at_ms <= observation.expires_at_ms:
+                raise ValueError("future or expired causal binding")
+        except (ValueError, TypeError, AttributeError):
+            return ["regime_bound_allocation_invalid"], None
+        # Weights remain capital ceilings, not regime permissions. Only the
+        # independent, exact deterministic mapping replaces legacy vetoes.
+        return self._allocation_gate(
+            basis.allocation,
+            strategy_id=intent.strategy_id,
+            side=intent.side,
+            decided_at_ms=decided_at_ms,
+            enforce_legacy_regime=False,
         )
 
     def _size_quantity(

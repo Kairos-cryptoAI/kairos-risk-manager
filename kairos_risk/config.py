@@ -5,10 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING, Literal
 
 from kairos_core.config import CoreSettings
 from kairos_core.enums import EvedexProfile, TradingMode
 from pydantic import Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from kairos_core.contracts.regime_capability import RegimeCapabilityPolicyV1
 
 PAPER_DEV_SYMBOL_MAP: Mapping[str, str] = MappingProxyType(
     {
@@ -85,6 +89,13 @@ class RiskSettings(CoreSettings):
     paper_max_position_notional_usd: float = Field(default=1_000.0, gt=0, allow_inf_nan=False)
     paper_min_notional_usd: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     paper_decision_cache_size: int = Field(default=10_000, ge=1)
+    # No deployment opt-in is supplied by this release. Mapping never promotes
+    # a strategy: the existing exact allowlist and hard-denied IDs still win.
+    paper_regime_policy_profile: Literal["legacy-v1", "adaptive-research-v1"] = "legacy-v1"
+    paper_regime_policy_file: Path | None = None
+    paper_regime_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    paper_regime_source_set_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    paper_regime_macro_source: str = "kairos-macro-strategist"
 
     # Circuit breaker.
     breaker_max_consecutive_failures: int = Field(default=2, ge=0)
@@ -145,7 +156,53 @@ class RiskSettings(CoreSettings):
                 raise ValueError("PAPER requires the durable Redis/PostgreSQL message path")
             if set(self.trading_symbols) != set(PAPER_DEV_SYMBOL_MAP):
                 raise ValueError("PAPER requires the exact five-symbol DEV allowlist")
+        regime_inputs = (
+            self.paper_regime_policy_file,
+            self.paper_regime_policy_sha256,
+            self.paper_regime_source_set_sha256,
+        )
+        if self.paper_regime_policy_profile == "legacy-v1" and any(
+            value is not None for value in regime_inputs
+        ):
+            raise ValueError("regime artifacts require an explicit adaptive-research-v1 opt-in")
+        if self.paper_regime_policy_profile == "adaptive-research-v1":
+            if self.trading_mode is not TradingMode.PAPER or any(value is None for value in regime_inputs):
+                raise ValueError(
+                    "adaptive regime policy requires PAPER and independently frozen file/hash/source set"
+                )
+            if (
+                not self.paper_regime_macro_source
+                or self.paper_regime_macro_source != self.paper_regime_macro_source.strip()
+            ):
+                raise ValueError("adaptive Macro source must be exact and normalized")
         return self
+
+    def load_regime_policy(self) -> RegimeCapabilityPolicyV1 | None:
+        if self.paper_regime_policy_profile == "legacy-v1":
+            return None
+        # Lazy import preserves the legacy profile with the previously pinned
+        # Core release. Opt-in requires the new contract release explicitly.
+        from kairos_core.contracts.regime_capability import RegimeCapabilityPolicyV1, validate_policy_binding
+
+        if (
+            self.paper_regime_policy_file is None
+            or self.paper_regime_policy_sha256 is None
+            or self.paper_regime_source_set_sha256 is None
+        ):
+            raise ValueError("adaptive regime policy requires independently frozen file/hash/source set")
+        policy = RegimeCapabilityPolicyV1.model_validate_json(self.paper_regime_policy_file.read_bytes())
+        allowed: set[tuple[str, str]] = set()
+        for item in self.paper_strategy_allowlist:
+            strategy_id, revision = item.split("@", maxsplit=1)
+            if self.paper_strategy_allowed(strategy_id, revision) and strategy_id != PAPER_CANARY_STRATEGY_ID:
+                allowed.add((strategy_id, revision))
+        validate_policy_binding(
+            policy,
+            expected_sha256=self.paper_regime_policy_sha256,
+            source_set_sha256=self.paper_regime_source_set_sha256,
+            allowed_strategy_revisions=allowed,
+        )
+        return policy
 
     def paper_strategy_allowed(self, strategy_id: str, strategy_revision: str) -> bool:
         if strategy_id in REJECTED_PAPER_STRATEGY_IDS:

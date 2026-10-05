@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kairos_core.contracts import (
     AccountSnapshotV2,
@@ -18,8 +19,11 @@ from kairos_core.contracts import (
 )
 from kairos_core.enums import EvedexProfile, OrderRole, SystemMode, TradingMode
 
-from .config import PAPER_DEV_SYMBOL_MAP, RiskSettings
+from .config import PAPER_CANARY_STRATEGY_ID, PAPER_DEV_SYMBOL_MAP, RiskSettings
 from .paper import PaperReservations, PaperRiskPipeline, reservation_view
+
+if TYPE_CHECKING:
+    from kairos_core.contracts.regime_capability import RegimeBoundAllocationV1
 
 
 class PaperInputUnavailable(RuntimeError):
@@ -57,6 +61,53 @@ class PaperRiskCoordinator:
         self._reservations: dict[str, _Reservation] = {}
         self._durable_recovery_loaded = False
         self._account_recovery_ready = False
+        self._regime_allocations: OrderedDict[str, RegimeBoundAllocationV1 | None] = OrderedDict()
+
+    def _needs_regime_binding(self, review: CandidateReviewV1) -> bool:
+        return (
+            self.pipeline.regime_policy is not None and review.intent.strategy_id != PAPER_CANARY_STRATEGY_ID
+        )
+
+    async def apply_regime_allocation(
+        self,
+        allocation: RegimeBoundAllocationV1,
+        *,
+        received_at_ms: int,
+    ) -> bool:
+        """Correlate exact intent evidence; contradictory bindings poison it."""
+        if self.pipeline.regime_policy is None:
+            raise ValueError("adaptive regime policy is not enabled")
+        from kairos_core.contracts.regime_capability import RegimeBoundAllocationV1
+
+        allocation = RegimeBoundAllocationV1.model_validate_json(allocation.model_dump_json())
+        if allocation.bound_at_ms > received_at_ms:
+            raise ValueError("regime binding postdates the trusted local receipt clock")
+        intent_id = allocation.observation.intent.intent_id
+        if intent_id is None:
+            raise ValueError("regime evidence has no immutable intent identity")
+        async with self._changed:
+            if intent_id in self._regime_allocations:
+                existing = self._regime_allocations[intent_id]
+                if existing is not None and existing.model_dump(mode="json") == allocation.model_dump(
+                    mode="json"
+                ):
+                    return False
+                self._regime_allocations[intent_id] = None
+                self._changed.notify_all()
+                raise ValueError("conflicting causal regime allocation for one intent")
+            self._regime_allocations[intent_id] = allocation
+            while len(self._regime_allocations) > self.settings.paper_decision_cache_size:
+                # Do not forget a poison/binding while a cached or reserved
+                # decision could still replay. This mirrors decision-cache
+                # retention and cannot revive a revoked cached approval.
+                retained = {decision.intent.intent_id for decision in self._decisions.values()}
+                retained.update(item.decision.intent.intent_id for item in self._reservations.values())
+                evictable = next((key for key in self._regime_allocations if key not in retained), None)
+                if evictable is None:
+                    break
+                self._regime_allocations.pop(evictable)
+            self._changed.notify_all()
+            return True
 
     @property
     def account(self) -> AccountSnapshotV2 | None:
@@ -180,7 +231,11 @@ class PaperRiskCoordinator:
         expected_symbol = PAPER_DEV_SYMBOL_MAP.get(review.intent.symbol)
         while True:
             async with self._changed:
-                if self.recovery_complete and expected_symbol in self._venue:
+                regime_ready = (
+                    not self._needs_regime_binding(review)
+                    or review.intent.intent_id in self._regime_allocations
+                )
+                if self.recovery_complete and expected_symbol in self._venue and regime_ready:
                     return
                 remaining_ms = review.intent.entry_expires_ts_ms - now_ms()
                 if remaining_ms <= 0:
@@ -211,6 +266,21 @@ class PaperRiskCoordinator:
         async with self._changed:
             if not self.recovery_complete:
                 raise PaperInputUnavailable("PAPER durable/account recovery is incomplete")
+            regime_allocation = self._regime_allocations.get(review.intent.intent_id or "")
+            regime_conflict = (
+                self._needs_regime_binding(review)
+                and review.intent.intent_id in self._regime_allocations
+                and regime_allocation is None
+            )
+            if regime_conflict:
+                admission_rejection_reasons = tuple(
+                    dict.fromkeys(
+                        (
+                            *admission_rejection_reasons,
+                            "regime_bound_allocation_conflict",
+                        )
+                    )
+                )
             cached = self._decisions.get(review_id)
             if cached is not None and not admission_rejection_reasons:
                 self._decisions.move_to_end(review_id)
@@ -230,6 +300,7 @@ class PaperRiskCoordinator:
                 system_mode=system_mode,
                 reservations=reservation_snapshot,
                 admission_rejection_reasons=admission_rejection_reasons,
+                regime_allocation=regime_allocation,
             )
             if admission_rejection_reasons:
                 # Admission authority is external to the decision cache.  A direct-bus

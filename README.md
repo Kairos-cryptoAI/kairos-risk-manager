@@ -12,6 +12,48 @@ Two authority paths are deliberately isolated:
   `RiskTradeDecisionV1`. It never accepts a legacy tactical mutation.
 - `TradingMode.LIVE` is a startup error in this release.
 
+## Versioned regime capability policy (not enabled in deployment)
+
+`paper_regime_policy_profile=legacy-v1` is the unchanged default. It keeps the
+blanket `CHOP` veto, `BEAR` long veto and `BULL` short veto. A positive Macro
+weight, LLM confidence, regime hint or this policy file never promotes a strategy.
+
+The separately opted-in `adaptive-research-v1` PAPER branch is wired through the
+real `RiskService` subscriber, `PaperRiskCoordinator` and `PaperRiskPipeline`.
+It consumes `kairos.macro.regime_bound_allocation.v1`, waits for the exact immutable
+intent binding until the existing entry deadline, and refuses legacy-allocation
+fallback. The frozen closed policy must have an independently configured full
+canonical policy SHA-256 and source-set SHA-256. Every mapping names the exact
+strategy ID/revision, strategy code/config fingerprints, deterministic detector
+code/config fingerprints, explicit regime and sides. Unknown/malformed mappings
+fail startup; mismatched, contradictory, missing, future or expired evidence fails
+closed. `CHOP` is not silently interpreted as `RANGE`; only a separate deterministic
+observation may assert `RANGE`.
+
+Bound capital preserves the actual Macro producer, PAPER DEV account scope,
+captured account snapshot identity, source set and policy identity. Its original
+capital basis and full binding have canonical digests; nested legacy allocation
+mutation is detected by complete revalidation at ingestion and admission. Market
+`event_as_of_ms` cannot postdate the strategy decision. Actual observation/production
+may follow that decision, but cannot exceed expiry or the trusted local receipt.
+An adaptive decision's `causation_id` points to the bound journal event; its review
+and immutable intent remain embedded unchanged. Conflicting bindings poison the
+intent even if an in-process approved decision is cached.
+
+This only replaces regime permission checks for non-canary intents. The existing
+empty-by-default exact revision allowlist, five hard-denied research sleeves,
+review, operator control, full reconciliation/recovery, venue/readiness, reservations
+and loss-at-stop sizing still apply. The 0.25% per-trade and 1% portfolio ceilings
+are unchanged. Technical canaries retain their existing separate LLM-free path.
+
+The tests exercise only explicitly labelled engineering strategy/detector fixtures.
+No strategy, policy artifact or deployment profile is activated by this change.
+The reviewed Core contract release must be pinned before any future opt-in. A
+production deterministic detector publisher and non-canary Execution integration
+are still missing: this is a checked runtime integration slice, not adaptive PAPER,
+alpha, Trial 15 or LIVE qualification. Macro-release/on-chain feed availability
+remains separate from both capital weights and regime capabilities.
+
 ## Safety properties
 
 - `KAIROS_REQUIRE_RECONCILED_ACCOUNT=true` by default. Do not disable it in live

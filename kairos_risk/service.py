@@ -461,6 +461,31 @@ class RiskService:
             except Exception:
                 log.exception("risk.paper_account_processing_failed", envelope_id=env.id)
 
+    async def _handle_regime_allocation(self, env: BusEnvelope) -> None:
+        from kairos_core.contracts.regime_capability import (
+            REGIME_BOUND_ALLOCATION_TOPIC,
+            RegimeBoundAllocationV1,
+        )
+
+        if env.topic != REGIME_BOUND_ALLOCATION_TOPIC:
+            raise ValueError("regime allocation arrived on the wrong versioned topic")
+        allocation = RegimeBoundAllocationV1.model_validate(env.payload)
+        await self.paper.apply_regime_allocation(allocation, received_at_ms=self._now_ms())
+
+    async def _consume_regime_allocation(self) -> None:
+        from kairos_core.contracts.regime_capability import REGIME_BOUND_ALLOCATION_TOPIC
+
+        async for env in self.bus.subscribe(
+            REGIME_BOUND_ALLOCATION_TOPIC,
+            group="risk-paper",
+            consumer="regime-bound-allocation",
+        ):
+            try:
+                await self._handle_regime_allocation(env)
+                await self.bus.ack(REGIME_BOUND_ALLOCATION_TOPIC, env, group="risk-paper")
+            except Exception:
+                log.exception("risk.regime_allocation_processing_failed", envelope_id=env.id)
+
     async def _handle_health(self, env: BusEnvelope) -> None:
         event = LLMHealthEvent.model_validate(env.payload)
         mode = self.apply_health_event(
@@ -736,6 +761,8 @@ class RiskService:
                     tasks.create_task(self._consume_paper_reviews(), name="paper-reviews")
                     tasks.create_task(self._consume_paper_venue(), name="paper-venue-quality")
                     tasks.create_task(self._consume_paper_account(), name="paper-account-v2")
+                    if self.paper_pipeline.regime_policy is not None:
+                        tasks.create_task(self._consume_regime_allocation(), name="paper-regime-allocation")
         finally:
             await self.close()
 
