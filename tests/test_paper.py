@@ -10,12 +10,14 @@ from kairos_core.contracts import (
     CandidateReviewV1,
     CandidateRouteV1,
     ExitPlanV1,
+    ObservedSimStrategyIntentV2,
     OpenOrderSnapshotV2,
     PositionSnapshotV2,
     StrategicAllocation,
     StrategyIntentV1,
     StrategyProvenanceV1,
     VenueQualityV1,
+    canonical_sha256,
 )
 from kairos_core.enums import (
     CandidateReviewTier,
@@ -257,6 +259,43 @@ def test_approved_quantity_is_exact_loss_at_stop_budget() -> None:
     assert decision.account_id == "kairos-paper-dev-01"
     assert decision.trade_id is not None
     assert decision.decision_id == decision.message_id
+
+
+def test_observed_sim_v2_is_never_a_paper_intent_even_when_allowlisted() -> None:
+    base = _intent()
+    protection = canonical_sha256(
+        {
+            "stop_price": base.exit_plan.stop_price,
+            "target_price": base.exit_plan.target_price,
+            "max_holding_ms": base.exit_plan.max_holding_ms,
+            "trailing_activation_price": None,
+            "trailing_distance": None,
+        }
+    )
+    metadata = dict(base.metadata)
+    metadata.update(
+        hypothesis_id=SHA_A,
+        source_set_sha256=SHA_B,
+        evidence_kind="CALLER_ATTESTED_POINT_IN_TIME",
+        entry_quote_sha256=SHA_C,
+        protection_sha256=protection,
+        confirmation_bar_close_ms=str(T0 + 59_999),
+    )
+    values = base.model_dump(mode="python")
+    values.update(
+        contract_version="strategy-intent.observed-sim.v2",
+        intent_id=None,
+        decision_ts_ms=T0 + 60_000,
+        entry_eligible_ts_ms=T0 + 60_000,
+        metadata=tuple(sorted(metadata.items())),
+    )
+    sim_intent = ObservedSimStrategyIntentV2(**values)
+
+    # This exact allowlisted strategy and fully favorable deterministic review,
+    # account, allocation and venue still must not authorize the SIM-only type.
+    decision = _evaluate(review=_review(intent=sim_intent), decided_at_ms=T0 + 60_200)
+    assert not decision.approved
+    assert "SIM_ONLY_INTENT" in decision.rejection_reasons
 
 
 def test_technical_canary_uses_exact_venue_minimum_or_rejects_capacity() -> None:

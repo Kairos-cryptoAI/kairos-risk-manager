@@ -125,6 +125,11 @@ class PaperRiskPipeline:
 
         if review.route.intent.model_dump(mode="json") != intent.model_dump(mode="json"):
             reasons.append("immutable_intent_mismatch")
+        # The observed-SIM v2 contract represents an immediate, quote-bound
+        # research hypothesis.  It is intentionally not a PAPER/LIVE order
+        # authorization, even if a matching strategy is later allowlisted.
+        if intent.contract_version == "strategy-intent.observed-sim.v2":
+            reasons.append("SIM_ONLY_INTENT")
         if review.decision is not ReviewDecision.ALLOW:
             reasons.append(f"review_{review.decision.value.lower()}")
         if not self.settings.paper_strategy_allowed(intent.strategy_id, intent.strategy_revision):
