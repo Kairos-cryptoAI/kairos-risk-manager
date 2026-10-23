@@ -56,7 +56,7 @@ def _scope(limits: LiveRiskLimitsV1 | None = None) -> LiveRiskScopeV1:
         account_id=ACCOUNT_ID,
         strategy_id="paper-test-strategy",
         strategy_revision="1",
-        approved_prod_symbols=(("BTCUSDT", "BTCUSD:PROD"),),
+        approved_prod_symbols=(("BTCUSDT", "BTCUSD"),),
     )
 
 
@@ -150,7 +150,7 @@ def _prod_venue(**overrides: object) -> VenueQualityV1:
     values: dict[str, object] = {
         "source": "venue-fixture",
         "profile": EvedexProfile.PROD,
-        "symbol": "BTCUSD:PROD",
+        "symbol": "BTCUSD",
         "observed_at_ms": NOW - 500,
         "expires_at_ms": NOW + 1_500,
         "reference_timestamp_ms": NOW - 550,
@@ -282,7 +282,7 @@ def test_registered_synthetic_source_can_approve_with_true_live_prod_context() -
     assert decision.trading_mode is TradingMode.LIVE
     assert decision.evedex_profile is EvedexProfile.PROD
     assert decision.account_id == ACCOUNT_ID
-    assert decision.venue_symbol == "BTCUSD:PROD"
+    assert decision.venue_symbol == "BTCUSD"
     assert decision.leverage == 1.0
     assert 0 < decision.quantity
     assert decision.quantity == pytest.approx(round(decision.quantity, 8))
@@ -323,6 +323,14 @@ def test_limits_cannot_inflate_policy(limits, message) -> None:
 def test_scope_binds_exact_risk_limits() -> None:
     with pytest.raises(ValueError, match="not bound"):
         LiveRiskEvaluator(_scope(), _limits(per_trade_dollar_cap_usd=501.0))
+
+
+@pytest.mark.parametrize("venue", ["BTCUSD:DEV", "BTCUSD:SIM", " btcusd"])
+def test_prod_scope_refuses_foreign_or_unnormalized_symbols(venue) -> None:
+    data = _scope().model_dump(mode="python")
+    data["approved_prod_symbols"] = (("BTCUSDT", venue),)
+    with pytest.raises(ValueError, match="normalized non-DEV/non-SIM"):
+        LiveRiskScopeV1.model_validate(data)
 
 
 def test_loss_dollar_cap_is_not_misinterpreted_as_an_order_notional_cap() -> None:

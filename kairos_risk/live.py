@@ -71,8 +71,8 @@ class LiveRiskScopeV1(StrictValueModel):
         for signal, venue in pairs:
             if not signal or signal != signal.strip().upper():
                 raise ValueError("approved signal symbols must be normalized uppercase")
-            if not venue or venue != venue.strip().upper() or not venue.endswith(":PROD"):
-                raise ValueError("approved venue symbols must be normalized PROD symbols")
+            if not venue or venue != venue.strip().upper() or venue.endswith((":DEV", ":SIM")):
+                raise ValueError("approved venue symbols must be normalized non-DEV/non-SIM symbols")
         object.__setattr__(self, "approved_prod_symbols", pairs)
         return self
 

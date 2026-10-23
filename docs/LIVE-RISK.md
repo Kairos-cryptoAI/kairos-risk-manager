@@ -48,6 +48,10 @@ mapping. Its `scope_sha256` is the Core `canonical_sha256` of the validated JSON
 model. These hashes identify a frozen scope; they are not signatures, custody
 proof, or proof that an upstream release file was reviewed. A deployment must
 establish that authority out-of-band before registering a verifier.
+Real venue instruments such as `BTCUSD` are used exactly as configured; no
+invented `:PROD` suffix is required. PROD identity comes from the explicit
+profile/context and closed mapping, not a naming convention. Explicit DEV/SIM
+instrument suffixes are refused.
 
 The verifier must attest to complete account state and mandatory numeric
 metrics. `aggregate_open_*` cover reconciled positions and open entry orders;
