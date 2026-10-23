@@ -291,6 +291,9 @@ def test_registered_synthetic_source_can_approve_with_true_live_prod_context() -
     assert result.evidence_sha256 == SHA_A
     assert result.account_snapshot_sha256 is not None
     assert result.account_equity_usd == 10_000.0
+    assert result.inputs_source_id == "fixture-upstream-inputs-v1"
+    assert result.inputs_evidence_sha256 == SHA_C
+    assert result.inputs_observed_at_ms == NOW - 500
     assert Decimal(str(decision.worst_case_loss_usd)) <= Decimal(str(decision.loss_budget_usd))
     assert Decimal(str(decision.notional_usd)) <= Decimal("3000")
 
@@ -398,10 +401,12 @@ def test_missing_input_verifier_and_proof_fail_closed() -> None:
     assert not no_verifier.decision.approved
     assert "input_source_unregistered" in no_verifier.decision.rejection_reasons
     assert no_verifier.inputs_source_id is None
+    assert no_verifier.inputs_observed_at_ms is None
 
     missing_proof = _evaluate(_evaluator(), raw_inputs_evidence=None)
     assert not missing_proof.decision.approved
     assert "input_source_proof_missing" in missing_proof.decision.rejection_reasons
+    assert missing_proof.inputs_observed_at_ms is None
 
 
 def test_daily_adverse_loss_cannot_offset_losses_with_profitable_pnl() -> None:
@@ -443,7 +448,7 @@ def test_fresh_venue_wrapper_does_not_refresh_old_book_or_reference() -> None:
     assert "venue_book_stale" in result.decision.rejection_reasons
 
 
-@pytest.mark.parametrize("mutate", ["scope", "review", "future", "stale"])
+@pytest.mark.parametrize("mutate", ["scope", "review", "future", "stale", "boolean_timestamp"])
 def test_input_verification_must_bind_fresh_exact_inputs(mutate) -> None:
     class AlteredInputsVerifier(FixtureInputsVerifier):
         def verify(self, raw_proof, **kwargs):
@@ -454,12 +459,16 @@ def test_input_verification_must_bind_fresh_exact_inputs(mutate) -> None:
                 return verified.model_copy(update={"review_sha256": SHA_B})
             if mutate == "future":
                 return verified.model_copy(update={"observed_at_ms": NOW + 1})
+            if mutate == "boolean_timestamp":
+                return verified.model_copy(update={"observed_at_ms": True})
             return verified.model_copy(update={"observed_at_ms": NOW - 5_001})
 
     result = _evaluate(_evaluator(input_verifier=AlteredInputsVerifier()))
     assert not result.decision.approved
     assert "input_source_verification_failed" in result.decision.rejection_reasons
     assert result.inputs_source_id is None
+    assert result.inputs_evidence_sha256 is None
+    assert result.inputs_observed_at_ms is None
 
 
 @pytest.mark.parametrize(

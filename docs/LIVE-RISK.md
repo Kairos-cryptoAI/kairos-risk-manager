@@ -94,9 +94,14 @@ capacity rejects rather than inflating quantity.
 Approved outputs are Core `RiskTradeDecisionV1` with `trading_mode=LIVE` and
 `evedex_profile=PROD`; rejected outputs remain truthful LIVE/PROD decisions
 with zero quantity and zero loss economics. `LiveRiskEvaluationV1` carries the
-scope, source/evidence/account digests and the exact verified metrics alongside
-that decision for a separate producer to bind. It is not an Execution signing
-record and cannot substitute for Execution's own order-geometry authorization.
+scope, source/evidence/account digests, the exact verified metrics, and the
+authenticated upstream-input receipt timestamp alongside that decision for a
+separate producer to bind. `inputs_observed_at_ms` is present only when the
+input verifier succeeds; a missing, stale, future-dated, or refused input proof
+leaves it `None` and the decision rejected. Producers must cap any downstream
+lease at this observation time plus the same five-second input-freshness bound.
+It is not an Execution signing record and cannot substitute for Execution's
+own order-geometry authorization.
 
 ## Current boundary
 

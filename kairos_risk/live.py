@@ -234,6 +234,7 @@ class LiveRiskEvaluationV1(StrictValueModel):
     account_equity_usd: float | None
     inputs_source_id: str | None
     inputs_evidence_sha256: str | None
+    inputs_observed_at_ms: int | None = Field(strict=True)
 
 
 class LiveRiskEvaluator:
@@ -466,6 +467,7 @@ class LiveRiskEvaluator:
             account_equity_usd=verified.account.equity_usd if verified else None,
             inputs_source_id=verified_inputs.source_id if verified_inputs else None,
             inputs_evidence_sha256=verified_inputs.evidence_sha256 if verified_inputs else None,
+            inputs_observed_at_ms=verified_inputs.observed_at_ms if verified_inputs else None,
         )
 
     def _admission_gates(
