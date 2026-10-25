@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping
 from datetime import UTC
 from decimal import ROUND_DOWN, Decimal
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from kairos_core.contracts import (
     AccountSnapshotV2,
@@ -37,6 +37,13 @@ from kairos_core.enums import (
 from pydantic import Field, model_validator
 
 from .strategy import allocation_error
+
+if TYPE_CHECKING:
+    from .capital_budget_proposal import (
+        CapitalBudgetPolicyV1,
+        CapitalBudgetProposalV1,
+        VenueMinimumNotionalV1,
+    )
 
 _MAX_ACCOUNT_AGE_MS = 5_000
 _MAX_VENUE_AGE_MS = 2_000
@@ -256,6 +263,41 @@ class LiveRiskEvaluator:
         self._input_verifier = input_verifier
         if any(not key or key != key.strip() for key in self._account_verifiers):
             raise ValueError("registered account source IDs must be normalized")
+
+    def propose_capital_budget(
+        self,
+        raw_account_evidence: object,
+        *,
+        source_id: str,
+        policy: CapitalBudgetPolicyV1,
+        venue_minimums: tuple[VenueMinimumNotionalV1, ...],
+        now_ms: int,
+    ) -> CapitalBudgetProposalV1:
+        """Calculate dollar ceilings through the existing registered verifier.
+
+        This never changes this evaluator's frozen limits/scope or grants an
+        arm. A changed proposal must be separately scoped and freshly verified.
+        An unregistered or unqualified account cannot bootstrap its own budget.
+        """
+        from .capital_budget_proposal import propose_capital_budget
+
+        verifier = self._account_verifiers.get(source_id)
+        if verifier is None:
+            raise ValueError("capital proposal requires a registered account source")
+        try:
+            verified = verifier.verify(raw_account_evidence, source_id=source_id, expected_scope=self.scope)
+            if type(verified) is not VerifiedLiveAccountV1 or verified.source_id != source_id:
+                raise ValueError("account verifier returned a foreign source")
+        except Exception:
+            raise ValueError("capital proposal account verification failed") from None
+        return propose_capital_budget(
+            verified_account=verified,
+            expected_scope=self.scope,
+            current_limits=self.limits,
+            policy=policy,
+            venue_minimums=venue_minimums,
+            now_ms=now_ms,
+        )
 
     def evaluate(
         self,

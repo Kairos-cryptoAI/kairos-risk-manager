@@ -29,6 +29,11 @@ from kairos_core.enums import (
     TradingMode,
 )
 
+from kairos_risk.capital_budget_proposal import (
+    CapitalBudgetPolicyV1,
+    VenueMinimumNotionalV1,
+    propose_capital_budget,
+)
 from kairos_risk.live import (
     LiveRiskEvaluator,
     LiveRiskLimitsV1,
@@ -544,6 +549,121 @@ def test_tiny_loss_budget_does_not_round_up_to_the_minimum_order() -> None:
     assert result.decision.notional_usd == 0
     assert result.decision.worst_case_loss_usd == 0
     assert "position_below_minimum_notional" in result.decision.rejection_reasons
+
+
+def test_small_account_budget_proposal_flows_through_live_evaluator_with_synthetic_verifiers() -> None:
+    limits = _limits()
+    original_scope = _scope(limits)
+    original_account = _live_account(
+        equity_usd=50.0,
+        available_balance_usd=50.0,
+        durable_day_start_equity_usd=50.0,
+        durable_peak_equity_usd=50.0,
+        captured_at_ms=NOW - 1_000,
+    )
+    original_verified = VerifiedLiveAccountV1(
+        source_id=SOURCE_ID,
+        scope_sha256=original_scope.scope_sha256,
+        evidence_sha256="e" * 64,
+        as_of_ms=original_account.captured_at_ms,
+        account=original_account,
+        aggregate_open_risk_usd=0.0,
+        aggregate_open_notional_usd=0.0,
+        reserved_open_risk_usd=0.0,
+        reserved_open_notional_usd=0.0,
+        strategy_open_notional_usd=0.0,
+        strategy_reserved_notional_usd=0.0,
+        daily_adverse_loss_usd=0.0,
+    )
+    proposal = propose_capital_budget(
+        verified_account=original_verified,
+        expected_scope=original_scope,
+        current_limits=limits,
+        policy=CapitalBudgetPolicyV1(
+            per_trade_risk_fraction=Decimal("0.0025"),
+            aggregate_open_risk_fraction=Decimal("0.01"),
+            daily_loss_fraction=Decimal("0.01"),
+        ),
+        venue_minimums=(
+            VenueMinimumNotionalV1(
+                venue_symbol="BTCUSD",
+                source_id="synthetic-venue-metadata-fixture",
+                observed_at_ms=NOW - 500,
+                evidence_sha256="f" * 64,
+                min_notional_usd=Decimal("5"),
+            ),
+        ),
+        now_ms=NOW,
+    )
+    assert proposal.proposed_limits.aggregate_dollar_cap_usd == 50.0
+    assert proposal.proposed_limits.max_position_notional_usd == 50.0
+
+    proposed_scope = _scope(proposal.proposed_limits)
+    proposed_verified = VerifiedLiveAccountV1.model_validate(
+        {
+            **original_verified.model_dump(mode="python"),
+            "scope_sha256": proposed_scope.scope_sha256,
+        }
+    )
+
+    class SyntheticProposalAccountVerifier:
+        def verify(self, raw_evidence, *, source_id, expected_scope):
+            assert raw_evidence == "synthetic-test-only-account-evidence"
+            assert source_id == SOURCE_ID
+            assert expected_scope.scope_sha256 == proposed_scope.scope_sha256
+            return proposed_verified
+
+    evaluator = LiveRiskEvaluator(
+        proposed_scope,
+        proposal.proposed_limits,
+        account_verifiers={SOURCE_ID: SyntheticProposalAccountVerifier()},
+        input_verifier=FixtureInputsVerifier(),
+    )
+    intent = _intent(exit_plan=ExitPlanV1(stop_price=99.5, target_price=105.0, max_holding_ms=180_000))
+    result = evaluator.evaluate(
+        raw_account_evidence="synthetic-test-only-account-evidence",
+        raw_inputs_evidence="fixture-input-proof",
+        source_id=SOURCE_ID,
+        review=_review(intent=intent),
+        venue=_prod_venue(),
+        allocation=_allocation(),
+        decided_at_ms=NOW,
+        system_mode=SystemMode.NORMAL,
+    )
+
+    assert result.decision.approved
+    assert 5.0 <= result.decision.notional_usd <= 50.0
+    assert result.decision.leverage == 1.0
+    assert result.decision.worst_case_loss_usd <= result.decision.loss_budget_usd
+    assert result.decision.loss_budget_usd <= 50.0 * 0.0025
+
+
+def test_evaluator_budget_proposal_uses_registered_source_without_changing_live_scope() -> None:
+    limits = _limits()
+    scope = _scope(limits)
+    evaluator = LiveRiskEvaluator(scope, limits, account_verifiers={SOURCE_ID: FixtureVerifier()})
+    metadata = VenueMinimumNotionalV1(
+        venue_symbol="BTCUSD",
+        source_id="synthetic-venue-fixture",
+        observed_at_ms=NOW - 500,
+        evidence_sha256="f" * 64,
+        min_notional_usd=Decimal("5"),
+    )
+    options = {
+        "source_id": SOURCE_ID,
+        "policy": CapitalBudgetPolicyV1(Decimal("0.0025"), Decimal("0.01"), Decimal("0.01")),
+        "venue_minimums": (metadata,),
+        "now_ms": NOW,
+    }
+    proposal = evaluator.propose_capital_budget("fixture-proof", **options)
+    assert proposal.authority is False
+    assert proposal.account_evidence_sha256 == SHA_A
+    assert evaluator.scope == scope and evaluator.limits == limits
+    with pytest.raises(ValueError, match="account verification failed"):
+        evaluator.propose_capital_budget("wrong-proof", **options)
+    unregistered = LiveRiskEvaluator(scope, limits)
+    with pytest.raises(ValueError, match="registered account source"):
+        unregistered.propose_capital_budget("fixture-proof", **options)
 
 
 def test_huge_finite_sizing_input_fails_bounded_and_closed() -> None:
