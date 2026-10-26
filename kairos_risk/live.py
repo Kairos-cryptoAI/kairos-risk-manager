@@ -185,6 +185,54 @@ class LiveAccountSourceVerifier(Protocol):
         ...
 
 
+class VerifiedLiveInstrumentRulesV1(StrictValueModel):
+    """Authenticated verifier output, never caller-supplied sizing authority.
+
+    ``observed_at_ms`` is the original metadata capture time, not the venue's
+    rule-change timestamp and not a newly wrapped receipt timestamp. The
+    registered input verifier must authenticate these facts with its receipts.
+    Only unit-sized, unit-multiplier quantity economics are supported.
+    """
+
+    source_id: str = Field(min_length=1, max_length=160)
+    scope_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    venue_symbol: str = Field(min_length=1, max_length=128)
+    profile: EvedexProfile
+    observed_at_ms: int = Field(ge=0, strict=True)
+    rules_updated_at_ms: int | None = Field(default=None, ge=0, strict=True)
+    price_increment: Decimal = Field(gt=0, allow_inf_nan=False)
+    quantity_increment: Decimal = Field(gt=0, allow_inf_nan=False)
+    min_price: Decimal = Field(gt=0, allow_inf_nan=False)
+    max_price: Decimal = Field(gt=0, allow_inf_nan=False)
+    min_quantity: Decimal = Field(gt=0, allow_inf_nan=False)
+    max_quantity: Decimal = Field(gt=0, allow_inf_nan=False)
+    min_notional_usd: Decimal = Field(gt=0, allow_inf_nan=False)
+    max_notional_usd: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
+    lot_size: Decimal = Field(gt=0, allow_inf_nan=False)
+    multiplier: Decimal = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_rules(self) -> VerifiedLiveInstrumentRulesV1:
+        if self.source_id != self.source_id.strip():
+            raise ValueError("instrument source_id must be normalized")
+        if (
+            self.profile is not EvedexProfile.PROD
+            or self.venue_symbol != self.venue_symbol.strip().upper()
+            or self.venue_symbol.endswith((":DEV", ":SIM"))
+        ):
+            raise ValueError("instrument rules must identify one normalized PROD symbol")
+        if self.lot_size != 1 or self.multiplier != 1:
+            raise ValueError("instrument lot size/multiplier are unsupported")
+        if self.min_price >= self.max_price or self.min_quantity > self.max_quantity:
+            raise ValueError("instrument bounds are incoherent")
+        if self.max_notional_usd is not None and self.min_notional_usd > self.max_notional_usd:
+            raise ValueError("instrument notional bounds are incoherent")
+        if self.rules_updated_at_ms is not None and self.rules_updated_at_ms > self.observed_at_ms:
+            raise ValueError("instrument rule-change timestamp postdates original capture")
+        return self
+
+
 class VerifiedLiveInputsV1(StrictValueModel):
     """Verifier output binding exact upstream inputs; hashes alone are not proof."""
 
@@ -196,6 +244,7 @@ class VerifiedLiveInputsV1(StrictValueModel):
     allocation_sha256: str | None
     system_mode: SystemMode
     observed_at_ms: int = Field(ge=0, strict=True)
+    instrument_rules: VerifiedLiveInstrumentRulesV1 | None = None
 
     @model_validator(mode="after")
     def validate_source_id(self) -> VerifiedLiveInputsV1:
@@ -242,6 +291,7 @@ class LiveRiskEvaluationV1(StrictValueModel):
     inputs_source_id: str | None
     inputs_evidence_sha256: str | None
     inputs_observed_at_ms: int | None = Field(strict=True)
+    instrument_rules: VerifiedLiveInstrumentRulesV1 | None = None
 
 
 class LiveRiskEvaluator:
@@ -254,6 +304,7 @@ class LiveRiskEvaluator:
         *,
         account_verifiers: Mapping[str, LiveAccountSourceVerifier] | None = None,
         input_verifier: LiveInputsSourceVerifier | None = None,
+        require_instrument_rules: bool = False,
     ) -> None:
         self.scope = LiveRiskScopeV1.model_validate(scope.model_dump(mode="json"))
         self.limits = LiveRiskLimitsV1.model_validate(limits.model_dump(mode="json"))
@@ -261,6 +312,9 @@ class LiveRiskEvaluator:
             raise ValueError("LIVE scope is not bound to the supplied immutable risk limits")
         self._account_verifiers = dict(account_verifiers or {})
         self._input_verifier = input_verifier
+        if type(require_instrument_rules) is not bool:
+            raise ValueError("require_instrument_rules must be a boolean")
+        self._require_instrument_rules = require_instrument_rules
         if any(not key or key != key.strip() for key in self._account_verifiers):
             raise ValueError("registered account source IDs must be normalized")
 
@@ -362,9 +416,28 @@ class LiveRiskEvaluator:
                 age_ms = decided_at_ms - verified_inputs.observed_at_ms
                 if age_ms < 0 or age_ms > _MAX_ACCOUNT_AGE_MS:
                     raise ValueError("upstream input receipt is future-dated or stale")
+                rules = verified_inputs.instrument_rules
+                if rules is not None:
+                    if (
+                        rules.source_id != verified_inputs.source_id
+                        or rules.scope_sha256 != self.scope.scope_sha256
+                        or rules.evidence_sha256 != verified_inputs.evidence_sha256
+                        or rules.venue_symbol != venue.symbol
+                    ):
+                        raise ValueError(
+                            "instrument rules differ from authenticated input scope/source/symbol"
+                        )
+                    if not (
+                        0 <= decided_at_ms - rules.observed_at_ms <= _MAX_ACCOUNT_AGE_MS
+                        and rules.observed_at_ms <= verified_inputs.observed_at_ms
+                    ):
+                        raise ValueError("original instrument capture is future-dated or stale")
             except Exception:
                 verified_inputs = None
                 reasons.append("input_source_verification_failed")
+        instrument_rules = verified_inputs.instrument_rules if verified_inputs else None
+        if self._require_instrument_rules and instrument_rules is None:
+            reasons.append("instrument_rules_missing")
         verifier = self._account_verifiers.get(source_id)
         if verifier is None:
             reasons.append("account_source_unregistered")
@@ -407,6 +480,11 @@ class LiveRiskEvaluator:
         strategy_reserved_notional = verified.strategy_reserved_notional_usd if verified is not None else 0.0
         daily_adverse = verified.daily_adverse_loss_usd if verified is not None else 0.0
         worst_entry = venue.best_ask if intent.side is Side.LONG else venue.best_bid
+        if instrument_rules is not None:
+            try:
+                worst_entry = self._instrument_entry(intent, worst_entry, instrument_rules)
+            except (ArithmeticError, ValueError):
+                reasons.append("instrument_price_geometry_invalid")
         loss_budget = 0.0
         quantity = 0.0
         fees = slippage = worst_loss = notional = 0.0
@@ -449,6 +527,7 @@ class LiveRiskEvaluator:
                             strategy_reserved_notional=strategy_reserved_notional,
                             loss_budget=loss_budget,
                             worst_entry=worst_entry,
+                            instrument_rules=instrument_rules,
                         )
                     except (ArithmeticError, ValueError):
                         quantity = notional = fees = slippage = worst_loss = 0.0
@@ -457,6 +536,12 @@ class LiveRiskEvaluator:
                         reasons.append("position_capacity_exhausted")
                     elif _d(notional) < _d(self.limits.min_notional_usd):
                         reasons.append("position_below_minimum_notional")
+                    if instrument_rules is not None and quantity > 0:
+                        if _d(quantity) < instrument_rules.min_quantity:
+                            reasons.append("position_below_instrument_minimum_quantity")
+                        # Test actual order notional, not conservatively rounded display cost.
+                        if _d(quantity) * _d(worst_entry) < instrument_rules.min_notional_usd:
+                            reasons.append("position_below_instrument_minimum_notional")
                 if worst_loss > loss_budget:
                     reasons.append("computed_loss_exceeds_budget")
             else:
@@ -510,7 +595,34 @@ class LiveRiskEvaluator:
             inputs_source_id=verified_inputs.source_id if verified_inputs else None,
             inputs_evidence_sha256=verified_inputs.evidence_sha256 if verified_inputs else None,
             inputs_observed_at_ms=verified_inputs.observed_at_ms if verified_inputs else None,
+            instrument_rules=instrument_rules,
         )
+
+    @staticmethod
+    def _instrument_entry(
+        intent: StrategyIntentV1, worst_entry: float, rules: VerifiedLiveInstrumentRulesV1
+    ) -> float:
+        """Validate geometry before sizing; never rewrite immutable inputs.
+
+        Core binds worst_entry_price to the exact original executable book, so
+        an off-grid quote cannot be repaired here by rounding its price.
+        """
+        tick = rules.price_increment
+        for price in (intent.exit_plan.stop_price, intent.exit_plan.target_price):
+            exact = _d(price)
+            if not rules.min_price <= exact <= rules.max_price or exact % tick != 0:
+                raise ValueError("immutable exit price violates authenticated instrument rules")
+        entry_decimal = _d(worst_entry)
+        if entry_decimal % tick != 0:
+            raise ValueError("original executable book price violates instrument tick")
+        if not rules.min_price <= entry_decimal <= rules.max_price:
+            raise ValueError("entry price violates authenticated instrument bounds")
+        stop, target = _d(intent.exit_plan.stop_price), _d(intent.exit_plan.target_price)
+        if intent.side is Side.LONG and not stop < entry_decimal < target:
+            raise ValueError("long entry violates immutable exit geometry")
+        if intent.side is Side.SHORT and not target < entry_decimal < stop:
+            raise ValueError("short entry violates immutable exit geometry")
+        return worst_entry
 
     def _admission_gates(
         self,
@@ -660,6 +772,7 @@ class LiveRiskEvaluator:
         strategy_reserved_notional: float,
         loss_budget: float,
         worst_entry: float,
+        instrument_rules: VerifiedLiveInstrumentRulesV1 | None = None,
     ) -> tuple[float, float, float, float, float]:
         slippage_bps = venue.buy_slippage_bps if intent.side is Side.LONG else venue.sell_slippage_bps
         entry = _d(worst_entry)
@@ -695,9 +808,13 @@ class LiveRiskEvaluator:
             remaining_gross,
             remaining_strategy,
         )
+        if instrument_rules is not None and instrument_rules.max_notional_usd is not None:
+            notional_cap = min(notional_cap, instrument_rules.max_notional_usd)
         unrounded = min(loss_budget_decimal / loss_per_unit, notional_cap / entry)
-        quantity_decimal = (unrounded / _QUANTITY_QUANTUM).to_integral_value(rounding=ROUND_DOWN)
-        quantity_decimal *= _QUANTITY_QUANTUM
+        quantum = instrument_rules.quantity_increment if instrument_rules else _QUANTITY_QUANTUM
+        if instrument_rules is not None:
+            unrounded = min(unrounded, instrument_rules.max_quantity)
+        quantity_decimal = (unrounded / quantum).to_integral_value(rounding=ROUND_DOWN) * quantum
 
         def economics(quantity_value: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
             notional_value = quantity_value * entry
@@ -711,6 +828,14 @@ class LiveRiskEvaluator:
                 return 0.0, 0.0, 0.0, 0.0, 0.0
             notional_decimal, fees_decimal, slippage_decimal, loss_decimal = economics(quantity_decimal)
             quantity = _lower_float(quantity_decimal)
+            if instrument_rules is not None and (
+                _d(quantity) != quantity_decimal
+                or _d(quantity) % quantum != 0
+                or _d(quantity) > instrument_rules.max_quantity
+            ):
+                # A nextafter float is not an instrument lot. Unsupported Core
+                # representation must reject, never leak an off-grid quantity.
+                raise ValueError("instrument quantity cannot be represented exactly in Core")
             displayed_stop_loss = _d(quantity) * abs(entry - stop)
             notional = _upper_float(max(notional_decimal, _d(quantity) * entry))
             fees = _upper_float(fees_decimal)
@@ -727,7 +852,7 @@ class LiveRiskEvaluator:
                 return quantity, notional, fees, slippage, worst_loss
             if correction == 2:
                 break
-            quantity_decimal -= _QUANTITY_QUANTUM
+            quantity_decimal -= quantum
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
 

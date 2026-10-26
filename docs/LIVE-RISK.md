@@ -14,6 +14,7 @@ evaluator = LiveRiskEvaluator(
     limits: LiveRiskLimitsV1,
     account_verifiers: Mapping[str, LiveAccountSourceVerifier] | None = None,
     input_verifier: LiveInputsSourceVerifier | None = None,
+    require_instrument_rules: bool = False,
 )
 
 result = evaluator.evaluate(
@@ -90,6 +91,46 @@ size, position and aggregate dollar caps, allocation gross capital, and
 strategy-weight capital, after subtracting only unrepresented reservations.
 Leverage is exactly 1x. No quota or minimum trade count is used; below-minimum
 capacity rejects rather than inflating quantity.
+
+## Authenticated PROD instrument geometry
+
+The PROD composer must explicitly set `require_instrument_rules=True`. In that
+mode approval additionally requires `VerifiedLiveInputsV1.instrument_rules`, a
+`VerifiedLiveInstrumentRulesV1` returned by the registered input verifier. No
+rules DTO or `verified=True` argument is accepted by `evaluate()`. The verifier
+must independently authenticate the exact original instrument payload and its
+capture receipt, not copy caller claims into a verified model. Its rules output
+must bind the same authenticated input source ID, frozen scope, exact mapped
+PROD symbol, and evidence digest. The evaluator revalidates the nested model.
+
+Rules contain exact decimal price/quantity increments, min/max price and
+quantity, minimum notional, and lot size/multiplier. An optional maximum notional
+is applied only when the source actually supplies that fact. Unit lot size and
+multiplier are the only supported economics; other values reject. Original
+`observed_at_ms` is the authenticated capture time, must not postdate the input
+receipt, and must be within five seconds of the decision. Optional
+`rules_updated_at_ms` is a rule-change date, must not postdate capture, and is
+not a capture-freshness clock. A fresh wrapper never refreshes old metadata.
+
+With verified rules, sizing floors to the real `quantity_increment`, applies
+instrument maximum quantity/notional alongside every existing risk/capital
+ceiling, and rejects below-minimum quantity or actual notional without sizing
+up. Conservative cost rounding is retained. The final Core float's decimal
+spelling must still be the exact calculated lot and a multiple of the step;
+unrepresentable geometry rejects rather than emitting a nextafter off-grid lot.
+The immutable stop/target and original executable book entry must satisfy the
+price tick and bounds before sizing. Core binds entry to the original top of
+book, so off-grid prices reject without rounding or rewriting intent, quote,
+or completed decision. Side-specific measured slippage remains separately
+charged in risk economics.
+
+For compatibility, the default does not require rules from older verifier
+implementations. Such evaluations gain no instrument-qualified authority;
+production composition must opt in, and missing rules then fail closed.
+Supplied rules are always validated/applied even in compatibility mode.
+`LiveRiskEvaluationV1.instrument_rules` exposes only successfully authenticated
+and scope/freshness-checked rules for a producer's provenance binding. This
+does not replace Execution's independent current-instrument guard.
 
 Approved outputs are Core `RiskTradeDecisionV1` with `trading_mode=LIVE` and
 `evedex_profile=PROD`; rejected outputs remain truthful LIVE/PROD decisions
