@@ -740,3 +740,46 @@ def test_paper_venue_cannot_be_relabelled_live() -> None:
     dev_venue = VenueQualityV1(**values)
     with pytest.raises(ValueError, match="EVEDEX PROD"):
         _evaluate(venue=dev_venue)
+
+
+def test_constitution_limit_account_equity_above_ceiling_refuses_entry() -> None:
+    limits = _limits(max_account_equity_usd=500.0)
+    result = _evaluate(
+        _evaluator(
+            verifier=FixtureVerifier(
+                account_overrides={
+                    "equity_usd": 600.0,
+                    "available_balance_usd": 600.0,
+                    "durable_day_start_equity_usd": 600.0,
+                    "durable_peak_equity_usd": 600.0,
+                }
+            ),
+            limits=limits,
+        )
+    )
+    assert not result.decision.approved and result.decision.quantity == 0
+    assert "account_equity_above_release_ceiling" in result.decision.rejection_reasons
+
+
+def test_constitution_limit_daily_loss_cap_refuses_entry_once_exhausted() -> None:
+    result = _evaluate(
+        _evaluator(
+            verifier=FixtureVerifier(daily_adverse_loss_usd=1_000.0),
+            limits=_limits(daily_loss_cap_usd=1_000.0),
+        )
+    )
+    assert not result.decision.approved and result.decision.quantity == 0
+    assert "daily_loss_limit_exhausted" in result.decision.rejection_reasons
+
+
+def test_constitution_limit_aggregate_open_risk_refuses_entry_once_exhausted() -> None:
+    account = _live_account()
+    result = _evaluate(
+        _evaluator(
+            verifier=FixtureVerifier(
+                aggregate_open_risk_usd=account.equity_usd * _limits().aggregate_open_risk_fraction,
+            ),
+        )
+    )
+    assert not result.decision.approved and result.decision.quantity == 0
+    assert "aggregate_open_risk_limit_exhausted" in result.decision.rejection_reasons
