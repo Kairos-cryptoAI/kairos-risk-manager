@@ -168,3 +168,50 @@ def test_instrument_cells_use_the_stricter_bound():
     assert cell.mean_r == aggregate.mean_r and cell.lower_r < aggregate.lower_r
     with pytest.raises(ValueError):
         LedgerPolicy(instrument_z=Decimal("1"))
+
+
+def test_leverage_follows_evidence_need_and_never_exceeds_the_constitution():
+    from kairos_risk.adaptive_risk import adaptive_leverage
+    from kairos_risk.learning import NO_EVIDENCE, EdgeEstimate
+    from kairos_risk.live import LiveRiskLimitsV1
+
+    policy = AdaptiveRiskPolicyV1()
+    proven = EdgeEstimate("strategy_symbol", 60, Decimal(60), Decimal("0.4"), Decimal("0.3"), Decimal("0.55"))
+    weak = EdgeEstimate("strategy", 60, Decimal(60), Decimal("0.1"), Decimal("0.05"), Decimal("0.5"))
+    equity = {"equity_usd": Decimal(100), "peak_equity_usd": Decimal(100)}
+
+    live_cap = Decimal(str(LiveRiskLimitsV1.model_fields["max_leverage"].default))
+    from tests.test_live_risk import _limits
+
+    assert _limits().max_leverage == 1.0
+    with pytest.raises(ValueError, match="max_leverage"):
+        _limits(max_leverage=2.0)
+    today = adaptive_leverage(policy, proven, constitution_max=live_cap, required_gross=Decimal(3), **equity)
+    assert today.leverage == 1 and "1x only" in today.reasons[0], "the live constitution is 1x"
+
+    cap = Decimal(3)
+    assert (
+        adaptive_leverage(
+            policy, NO_EVIDENCE, constitution_max=cap, required_gross=Decimal(3), **equity
+        ).leverage
+        == 1
+    )
+    full = adaptive_leverage(policy, proven, constitution_max=cap, required_gross=Decimal(5), **equity)
+    assert full.leverage == 3, "a lower bound beyond the full-edge scale may use the whole cap"
+    assert adaptive_leverage(
+        policy, proven, constitution_max=cap, required_gross=Decimal("1.37"), **equity
+    ).leverage == Decimal("1.3")
+    assert adaptive_leverage(
+        policy, weak, constitution_max=cap, required_gross=Decimal(5), **equity
+    ).leverage == Decimal("1.4")
+    drawdown = {"equity_usd": Decimal(99), "peak_equity_usd": Decimal(100)}
+    assert (
+        adaptive_leverage(
+            policy, proven, constitution_max=cap, required_gross=Decimal(5), **drawdown
+        ).leverage
+        == 1
+    )
+    with pytest.raises(ValueError):
+        adaptive_leverage(
+            policy, proven, constitution_max=Decimal("0.5"), required_gross=Decimal(1), **equity
+        )

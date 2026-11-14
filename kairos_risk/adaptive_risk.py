@@ -14,6 +14,13 @@ the system decides, from evidence only:
 
 The result never exceeds the ceiling and is rounded down. ``adapt_limits`` applies it to
 ``LiveRiskLimitsV1``; a zero result means no entry for this candidate.
+
+**Leverage** (``adaptive_leverage``) is decided the same way and is capped by the owner's
+constitution (``LiveRiskLimitsV1.max_leverage``, today exactly 1x): 1x without a proven
+positive edge or in a drawdown, more only as far as the open positions actually need it
+and the proven lower bound allows. Leverage never raises the per-trade risk, which is
+set by the stop distance and the fraction above; it only lets the account hold the
+notional that this risk requires.
 """
 
 from __future__ import annotations
@@ -120,6 +127,51 @@ def adaptive_risk_fraction(
     return AdaptiveRiskDecisionV1(fraction, multiplier.quantize(Decimal("0.0001")), tuple(reasons))
 
 
+@dataclass(frozen=True, slots=True)
+class AdaptiveLeverageDecisionV1:
+    leverage: Decimal
+    reasons: tuple[str, ...]
+
+
+def adaptive_leverage(
+    policy: AdaptiveRiskPolicyV1,
+    edge: EdgeEstimate,
+    *,
+    constitution_max: Decimal,
+    required_gross: Decimal,
+    equity_usd: Decimal,
+    peak_equity_usd: Decimal,
+) -> AdaptiveLeverageDecisionV1:
+    """The account leverage the evidence allows, never above the constitution and never above need.
+
+    ``required_gross`` is the open plus proposed notional over equity. Rounded down to 0.1x;
+    never below 1x (the venue's unleveraged setting).
+    """
+    cap = _decimal(constitution_max, "constitution_max")
+    need = _decimal(required_gross, "required_gross")
+    equity, peak = _decimal(equity_usd, "equity_usd"), _decimal(peak_equity_usd, "peak_equity_usd")
+    if cap < 1 or need < 0 or equity <= 0 or peak < equity:
+        raise ValueError("leverage inputs: a cap of at least 1x, a non-negative need and valid equity")
+    if cap == 1:
+        return AdaptiveLeverageDecisionV1(Decimal(1), ("the constitution allows 1x only",))
+    if not edge.proven or edge.lower_r <= 0:
+        return AdaptiveLeverageDecisionV1(Decimal(1), (f"no proven positive edge ({edge.level}): 1x",))
+    drawdown = (peak - equity) / peak
+    if drawdown > 0:
+        return AdaptiveLeverageDecisionV1(Decimal(1), (f"drawdown {drawdown:.4f} from peak: 1x",))
+    share = min(Decimal(1), edge.lower_r / policy.full_edge_r)
+    allowed = 1 + (cap - 1) * share
+    leverage = max(Decimal(1), min(cap, allowed, need))
+    leverage = leverage.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
+    return AdaptiveLeverageDecisionV1(
+        leverage,
+        (
+            f"proven edge ({edge.level}: lower bound {edge.lower_r} R) allows {allowed:.2f}x",
+            f"open and proposed notional need {need:.2f}x; constitution caps at {cap}x",
+        ),
+    )
+
+
 def adapt_limits(limits: LiveRiskLimitsV1, decision: AdaptiveRiskDecisionV1) -> LiveRiskLimitsV1 | None:
     """The same limits with the adaptive per-trade fraction, never above the original; None = no entry."""
     if not decision.allows_entry:
@@ -131,8 +183,10 @@ def adapt_limits(limits: LiveRiskLimitsV1, decision: AdaptiveRiskDecisionV1) -> 
 
 
 __all__ = [
+    "AdaptiveLeverageDecisionV1",
     "AdaptiveRiskDecisionV1",
     "AdaptiveRiskPolicyV1",
     "adapt_limits",
+    "adaptive_leverage",
     "adaptive_risk_fraction",
 ]
