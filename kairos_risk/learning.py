@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
 
-Level = Literal["strategy_symbol_regime", "strategy_regime", "strategy", "none"]
+Level = Literal["strategy_symbol_regime", "strategy_symbol", "strategy_regime", "strategy", "none"]
 Source = Literal["LIVE", "REPLAY"]
 UNKNOWN_REGIME = "UNKNOWN"
 
@@ -71,16 +71,28 @@ class LedgerPolicy:
     minimum_effective_samples: Decimal = Decimal(20)
     replay_weight: Decimal = Decimal("0.5")
     z: Decimal = Decimal("1.645")
+    # Instrument cells are chosen among many, so a single one needs a stricter bound (99 %).
+    instrument_z: Decimal = Decimal("2.326")
 
     def __post_init__(self) -> None:
-        if not (self.minimum_effective_samples >= 5 and 0 < self.replay_weight <= 1 and self.z > 0):
-            raise ValueError("ledger policy needs >= 5 samples, a replay weight in (0, 1] and z > 0")
+        if not (
+            self.minimum_effective_samples >= 5
+            and 0 < self.replay_weight <= 1
+            and self.z > 0
+            and self.instrument_z >= self.z
+        ):
+            raise ValueError(
+                "ledger policy needs >= 5 samples, a replay weight in (0, 1] and 0 < z <= instrument_z"
+            )
 
 
 @dataclass(slots=True)
 class LearningLedger:
     outcomes: tuple[TradeOutcome, ...]
     policy: LedgerPolicy = field(default_factory=LedgerPolicy)
+
+    def _z(self, level: Level) -> Decimal:
+        return self.policy.instrument_z if level.startswith("strategy_symbol") else self.policy.z
 
     def _estimate(self, rows: list[TradeOutcome], level: Level) -> EdgeEstimate | None:
         weights = [Decimal(1) if row.source == "LIVE" else self.policy.replay_weight for row in rows]
@@ -103,7 +115,7 @@ class LearningLedger:
             samples=len(rows),
             effective_samples=effective.quantize(Decimal("0.01")),
             mean_r=mean.quantize(Decimal("0.0001")),
-            lower_r=(mean - self.policy.z * standard_error).quantize(Decimal("0.0001")),
+            lower_r=(mean - self._z(level) * standard_error).quantize(Decimal("0.0001")),
             win_rate=(wins / total).quantize(Decimal("0.0001")),
         )
 
@@ -112,6 +124,7 @@ class LearningLedger:
         own = [row for row in self.outcomes if row.strategy_id == strategy_id]
         for level, rows in (
             ("strategy_symbol_regime", [r for r in own if r.symbol == symbol and r.regime == regime]),
+            ("strategy_symbol", [r for r in own if r.symbol == symbol]),
             ("strategy_regime", [r for r in own if r.regime == regime]),
             ("strategy", own),
         ):

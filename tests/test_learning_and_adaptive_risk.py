@@ -34,6 +34,9 @@ def test_ledger_needs_enough_evidence_and_falls_back_only_within_the_strategy():
     )
     estimate = ledger.estimate("hourly_trend", "SOLUSDT", "BULL")
     assert estimate.level == "strategy_regime" and estimate.samples == 30
+    replays = LearningLedger(tuple(_outcomes([0.8, 0.2] * 20, regime="UNKNOWN", source="REPLAY")))
+    by_symbol = replays.estimate("hourly_trend", "SOLUSDT", "BEAR")
+    assert by_symbol.level == "strategy_symbol" and by_symbol.lower_r > 0, "history of the instrument counts"
     assert ledger.estimate("unknown", "SOLUSDT", "BULL") is NO_EVIDENCE
     assert ledger.estimate("hourly_trend", "SOLUSDT", "BEAR").level == "strategy"
 
@@ -153,3 +156,15 @@ def test_adapted_limits_shrink_the_real_evaluators_size_without_changing_the_str
         )
         is None
     )
+
+
+def test_instrument_cells_use_the_stricter_bound():
+    rows = tuple(_outcomes([0.6, -0.2] * 20))
+    ledger = LearningLedger(rows)
+    cell = ledger.estimate("hourly_trend", "SOLUSDT", "BULL")
+    aggregate = LearningLedger(rows, LedgerPolicy(instrument_z=Decimal("1.645"))).estimate(
+        "hourly_trend", "SOLUSDT", "BULL"
+    )
+    assert cell.mean_r == aggregate.mean_r and cell.lower_r < aggregate.lower_r
+    with pytest.raises(ValueError):
+        LedgerPolicy(instrument_z=Decimal("1"))
