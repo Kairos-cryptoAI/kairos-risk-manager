@@ -12,6 +12,21 @@ Two authority paths are deliberately isolated:
   `RiskTradeDecisionV1`. It never accepts a legacy tactical mutation.
 - `TradingMode.LIVE` is a startup error in this release.
 
+## Learning ledger, adaptive risk and leverage (library, used by the live runner)
+
+`kairos_risk.learning.LearningLedger` keeps every closed trade in R (net result over the
+decision's worst-case loss) and estimates the edge of a strategy x instrument x regime
+cell, falling back to coarser cells within the same strategy. Live trades weigh 1 and
+replayed signals 0.5; a cell needs 20 effective samples, and its lower bound is taken at
+95% one-sided (99% for a single instrument). `kairos_risk.adaptive_risk` turns that into
+the share of the owner's per-trade ceiling (0.25%): half without evidence, nothing with a
+proven non-positive lower bound, more only as the lower bound grows; drawdown, a low
+review priority and venue cost only lower it. `adapt_limits` applies it to
+`LiveRiskLimitsV1` and can only lower the configured fraction. `adaptive_leverage`
+decides leverage by the same evidence, never above the constitution's `max_leverage`,
+which `LiveRiskLimitsV1` fixes at exactly 1x. None of this changes a validation gate of
+`LiveRiskEvaluator`.
+
 ## Versioned regime capability policy (not enabled in deployment)
 
 `paper_regime_policy_profile=legacy-v1` is the unchanged default. It keeps the
