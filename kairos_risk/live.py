@@ -91,12 +91,21 @@ class LiveRiskScopeV1(StrictValueModel):
         return next((venue for signal, venue in self.approved_prod_symbols if signal == signal_symbol), None)
 
 
+# The owner's constitution (2026-11-16): leverage is chosen per trade by evidence and
+# need, never above 30x. It never raises the stop-loss risk of a trade.
+CONSTITUTION_MAX_LEVERAGE = 30.0
+# A stop must sit at most this share of the way to the liquidation price (about 1/leverage).
+MAX_STOP_SHARE_OF_LIQUIDATION = 0.5
+
+
 class LiveRiskLimitsV1(StrictValueModel):
     """Monotone hard ceilings; construction cannot relax the LIVE policy."""
 
     per_trade_risk_fraction: float = Field(gt=0, le=0.0025, allow_inf_nan=False, strict=True)
     aggregate_open_risk_fraction: float = Field(gt=0, le=0.01, allow_inf_nan=False, strict=True)
-    max_leverage: float = Field(default=1.0, ge=1.0, le=1.0, allow_inf_nan=False, strict=True)
+    max_leverage: float = Field(
+        default=1.0, ge=1.0, le=CONSTITUTION_MAX_LEVERAGE, allow_inf_nan=False, strict=True
+    )
     per_trade_dollar_cap_usd: float = Field(
         gt=0,
         allow_inf_nan=False,
@@ -364,9 +373,14 @@ class LiveRiskEvaluator:
         decided_at_ms: int,
         system_mode: SystemMode = SystemMode.NORMAL,
         raw_inputs_evidence: object | None = None,
+        leverage: float = 1.0,
     ) -> LiveRiskEvaluationV1:
+        """``leverage`` is this trade's account leverage (``adaptive_risk.adaptive_leverage``):
+        it sets the margin the position uses, never its stop-loss risk."""
         if isinstance(decided_at_ms, bool) or not isinstance(decided_at_ms, int) or decided_at_ms < 0:
             raise ValueError("decided_at_ms must be a non-negative integer")
+        if isinstance(leverage, bool) or not isinstance(leverage, int | float) or not math.isfinite(leverage):
+            raise ValueError("leverage must be a finite number")
         review = CandidateReviewV1.model_validate_json(review.model_dump_json())
         venue = VenueQualityV1.model_validate_json(venue.model_dump_json())
         if venue.profile is not EvedexProfile.PROD:
@@ -488,6 +502,11 @@ class LiveRiskEvaluator:
         loss_budget = 0.0
         quantity = 0.0
         fees = slippage = worst_loss = notional = 0.0
+        if not 1.0 <= leverage <= self.limits.max_leverage:
+            reasons.append("leverage_outside_constitution")
+        stop_share = abs(_d(worst_entry) - _d(intent.exit_plan.stop_price)) / _d(worst_entry)
+        if leverage > 1 and stop_share * _d(leverage) > _d(MAX_STOP_SHARE_OF_LIQUIDATION):
+            reasons.append("stop_too_close_to_liquidation")
 
         if verified is not None:
             allocation_error_text = allocation_error(allocation) if allocation is not None else "missing"
@@ -528,6 +547,7 @@ class LiveRiskEvaluator:
                             loss_budget=loss_budget,
                             worst_entry=worst_entry,
                             instrument_rules=instrument_rules,
+                            leverage=leverage,
                         )
                     except (ArithmeticError, ValueError):
                         quantity = notional = fees = slippage = worst_loss = 0.0
@@ -568,7 +588,7 @@ class LiveRiskEvaluator:
             account_id=account_id,
             venue_symbol=venue.symbol,
             quantity=quantity,
-            leverage=1.0,
+            leverage=float(leverage),
             notional_usd=notional,
             loss_budget_usd=loss_budget if approved else 0.0,
             worst_case_loss_usd=worst_loss,
@@ -773,6 +793,7 @@ class LiveRiskEvaluator:
         loss_budget: float,
         worst_entry: float,
         instrument_rules: VerifiedLiveInstrumentRulesV1 | None = None,
+        leverage: float = 1.0,
     ) -> tuple[float, float, float, float, float]:
         slippage_bps = venue.buy_slippage_bps if intent.side is Side.LONG else venue.sell_slippage_bps
         entry = _d(worst_entry)
@@ -787,15 +808,20 @@ class LiveRiskEvaluator:
 
         equity = _d(account.equity_usd)
         deployable_equity = equity * (Decimal(1) - _d(allocation.stable_reserve_pct))
-        allocation_gross_cap = deployable_equity * min(Decimal(1), _d(allocation.max_gross_leverage))
+        # Gross exposure: the Macro Strategist's cap, never above the constitution's leverage.
+        gross = min(_d(allocation.max_gross_leverage), _d(self.limits.max_leverage))
+        allocation_gross_cap = deployable_equity * gross
         remaining_gross = max(Decimal(0), allocation_gross_cap - _d(open_notional) - _d(reserved_notional))
         remaining_strategy = max(
             Decimal(0),
-            equity * _d(allocation.strategy_weights[intent.strategy_id])
+            equity * _d(allocation.strategy_weights[intent.strategy_id]) * gross
             - _d(strategy_notional)
             - _d(strategy_reserved_notional),
         )
-        available_balance = max(Decimal(0), _d(account.available_balance_usd) - _d(reserved_notional))
+        # The margin this position may use: the free balance at this trade's leverage.
+        available_balance = max(
+            Decimal(0), (_d(account.available_balance_usd) - _d(reserved_notional)) * _d(leverage)
+        )
         notional_cap = min(
             _d(self.limits.max_position_notional_usd),
             max(

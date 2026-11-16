@@ -26,7 +26,7 @@ notional that this risk requires.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 
 from .learning import EdgeEstimate
 from .live import LiveRiskLimitsV1
@@ -133,6 +133,10 @@ class AdaptiveLeverageDecisionV1:
     reasons: tuple[str, ...]
 
 
+UNPROVEN_LEVERAGE = Decimal(3)
+STOP_SHARE_OF_LIQUIDATION = Decimal("0.5")
+
+
 def adaptive_leverage(
     policy: AdaptiveRiskPolicyV1,
     edge: EdgeEstimate,
@@ -141,11 +145,19 @@ def adaptive_leverage(
     required_gross: Decimal,
     equity_usd: Decimal,
     peak_equity_usd: Decimal,
+    stop_fraction: Decimal | None = None,
+    venue_max: Decimal | None = None,
 ) -> AdaptiveLeverageDecisionV1:
-    """The account leverage the evidence allows, never above the constitution and never above need.
+    """This trade's account leverage: as much as the book needs, as little as possible.
 
-    ``required_gross`` is the open plus proposed notional over equity. Rounded down to 0.1x;
-    never below 1x (the venue's unleveraged setting).
+    ``required_gross`` is the open plus this trade's full-risk notional over equity: the
+    leverage that lets them all hold margin. It is capped by the evidence (3x without a
+    proven edge, up to the constitution as the proven lower bound grows, nothing beyond 1x
+    for a proven non-positive edge), by drawdown (the evidence cap shrinks like the risk
+    share), by the stop (it must sit at most half way to liquidation, about 1/leverage),
+    by the venue's own maximum and by the constitution. Whole numbers, at least 1x.
+    Leverage never raises a trade's stop-loss risk; the stop distance and the adaptive
+    fraction set that.
     """
     cap = _decimal(constitution_max, "constitution_max")
     need = _decimal(required_gross, "required_gross")
@@ -154,22 +166,36 @@ def adaptive_leverage(
         raise ValueError("leverage inputs: a cap of at least 1x, a non-negative need and valid equity")
     if cap == 1:
         return AdaptiveLeverageDecisionV1(Decimal(1), ("the constitution allows 1x only",))
-    if not edge.proven or edge.lower_r <= 0:
-        return AdaptiveLeverageDecisionV1(Decimal(1), (f"no proven positive edge ({edge.level}): 1x",))
+    reasons: list[str] = []
+    if not edge.proven:
+        evidence_cap = min(cap, UNPROVEN_LEVERAGE)
+        reasons.append(f"edge not proven yet: up to {evidence_cap}x for margin only")
+    elif edge.lower_r <= 0:
+        evidence_cap = Decimal(1)
+        reasons.append(f"no proven positive edge ({edge.level}): 1x")
+    else:
+        share = min(Decimal(1), edge.lower_r / policy.full_edge_r)
+        evidence_cap = min(cap, UNPROVEN_LEVERAGE + (cap - UNPROVEN_LEVERAGE) * share)
+        reasons.append(f"proven edge ({edge.level}: lower bound {edge.lower_r} R): up to {evidence_cap:.1f}x")
     drawdown = (peak - equity) / peak
     if drawdown > 0:
-        return AdaptiveLeverageDecisionV1(Decimal(1), (f"drawdown {drawdown:.4f} from peak: 1x",))
-    share = min(Decimal(1), edge.lower_r / policy.full_edge_r)
-    allowed = 1 + (cap - 1) * share
-    leverage = max(Decimal(1), min(cap, allowed, need))
-    leverage = leverage.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
-    return AdaptiveLeverageDecisionV1(
-        leverage,
-        (
-            f"proven edge ({edge.level}: lower bound {edge.lower_r} R) allows {allowed:.2f}x",
-            f"open and proposed notional need {need:.2f}x; constitution caps at {cap}x",
-        ),
-    )
+        evidence_cap = max(Decimal(1), evidence_cap / (1 + drawdown / policy.drawdown_halving_fraction))
+        reasons.append(f"drawdown {drawdown:.4f}: up to {evidence_cap:.1f}x")
+    caps = [cap, evidence_cap]
+    if stop_fraction is not None:
+        stop = _decimal(stop_fraction, "stop_fraction")
+        if stop > 0:
+            caps.append(STOP_SHARE_OF_LIQUIDATION / stop)
+            reasons.append(
+                f"stop {stop:.4%} away: liquidation-safe up to {STOP_SHARE_OF_LIQUIDATION / stop:.1f}x"
+            )
+    if venue_max is not None and _decimal(venue_max, "venue_max") >= 1:
+        caps.append(_decimal(venue_max, "venue_max"))
+    ceiling = max(Decimal(1), min(caps).to_integral_value(rounding=ROUND_DOWN))
+    wanted = max(Decimal(1), need.to_integral_value(rounding=ROUND_CEILING))
+    leverage = min(ceiling, wanted)
+    reasons.append(f"the book needs {need:.2f}x of margin; ceiling {ceiling}x")
+    return AdaptiveLeverageDecisionV1(leverage, tuple(reasons))
 
 
 def adapt_limits(limits: LiveRiskLimitsV1, decision: AdaptiveRiskDecisionV1) -> LiveRiskLimitsV1 | None:

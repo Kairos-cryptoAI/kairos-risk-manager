@@ -170,48 +170,60 @@ def test_instrument_cells_use_the_stricter_bound():
         LedgerPolicy(instrument_z=Decimal("1"))
 
 
-def test_leverage_follows_evidence_need_and_never_exceeds_the_constitution():
+def test_leverage_follows_need_evidence_stop_and_never_exceeds_the_constitution():
     from kairos_risk.adaptive_risk import adaptive_leverage
     from kairos_risk.learning import NO_EVIDENCE, EdgeEstimate
-    from kairos_risk.live import LiveRiskLimitsV1
-
-    policy = AdaptiveRiskPolicyV1()
-    proven = EdgeEstimate("strategy_symbol", 60, Decimal(60), Decimal("0.4"), Decimal("0.3"), Decimal("0.55"))
-    weak = EdgeEstimate("strategy", 60, Decimal(60), Decimal("0.1"), Decimal("0.05"), Decimal("0.5"))
-    equity = {"equity_usd": Decimal(100), "peak_equity_usd": Decimal(100)}
-
-    live_cap = Decimal(str(LiveRiskLimitsV1.model_fields["max_leverage"].default))
+    from kairos_risk.live import CONSTITUTION_MAX_LEVERAGE
     from tests.test_live_risk import _limits
 
-    assert _limits().max_leverage == 1.0
+    assert _limits(max_leverage=30.0).max_leverage == CONSTITUTION_MAX_LEVERAGE == 30.0
     with pytest.raises(ValueError, match="max_leverage"):
-        _limits(max_leverage=2.0)
-    today = adaptive_leverage(policy, proven, constitution_max=live_cap, required_gross=Decimal(3), **equity)
-    assert today.leverage == 1 and "1x only" in today.reasons[0], "the live constitution is 1x"
+        _limits(max_leverage=31.0)
 
-    cap = Decimal(3)
-    assert (
-        adaptive_leverage(
-            policy, NO_EVIDENCE, constitution_max=cap, required_gross=Decimal(3), **equity
+    policy = AdaptiveRiskPolicyV1()
+    cap = Decimal(30)
+    proven = EdgeEstimate("strategy_symbol", 60, Decimal(60), Decimal("0.4"), Decimal("0.3"), Decimal("0.55"))
+    weak = EdgeEstimate("strategy", 60, Decimal(60), Decimal("0.1"), Decimal("0.05"), Decimal("0.5"))
+    negative = EdgeEstimate("strategy", 60, Decimal(60), Decimal("-0.1"), Decimal("-0.2"), Decimal("0.4"))
+    flat = {"equity_usd": Decimal(100), "peak_equity_usd": Decimal(100)}
+
+    def lev(edge, need, **kw):
+        values = {**flat, **{k: v for k, v in kw.items() if k in ("equity_usd", "peak_equity_usd")}}
+        extra = {k: v for k, v in kw.items() if k in ("stop_fraction", "venue_max")}
+        return adaptive_leverage(
+            policy, edge, constitution_max=cap, required_gross=Decimal(str(need)), **values, **extra
         ).leverage
-        == 1
-    )
-    full = adaptive_leverage(policy, proven, constitution_max=cap, required_gross=Decimal(5), **equity)
-    assert full.leverage == 3, "a lower bound beyond the full-edge scale may use the whole cap"
-    assert adaptive_leverage(
-        policy, proven, constitution_max=cap, required_gross=Decimal("1.37"), **equity
-    ).leverage == Decimal("1.3")
-    assert adaptive_leverage(
-        policy, weak, constitution_max=cap, required_gross=Decimal(5), **equity
-    ).leverage == Decimal("1.4")
-    drawdown = {"equity_usd": Decimal(99), "peak_equity_usd": Decimal(100)}
-    assert (
-        adaptive_leverage(
-            policy, proven, constitution_max=cap, required_gross=Decimal(5), **drawdown
-        ).leverage
-        == 1
-    )
+
+    assert lev(NO_EVIDENCE, "0.6") == 1, "no more than the book needs"
+    assert lev(NO_EVIDENCE, "2.2") == 3, "whole numbers, rounded up to fit the margin"
+    assert lev(NO_EVIDENCE, 12) == 3, "without proof: margin only, at most 3x"
+    assert lev(proven, 40) == 30, "a strong proven edge may use the whole constitution"
+    assert lev(weak, 40) == 8, "a weak one: 3 + 27 x 0.2"
+    assert lev(negative, 12) == 1
+    assert lev(proven, 40, equity_usd=Decimal(98)) == 15, "a 2% drawdown halves the evidence cap"
+    assert lev(proven, 40, stop_fraction=Decimal("0.04")) == 12, "the stop stays half way to liquidation"
+    assert lev(proven, 40, venue_max=Decimal(20)) == 20, "never above the venue's own maximum"
+    one = adaptive_leverage(policy, proven, constitution_max=Decimal(1), required_gross=Decimal(5), **flat)
+    assert one.leverage == 1 and "1x only" in one.reasons[0]
     with pytest.raises(ValueError):
-        adaptive_leverage(
-            policy, proven, constitution_max=Decimal("0.5"), required_gross=Decimal(1), **equity
-        )
+        adaptive_leverage(policy, proven, constitution_max=Decimal("0.5"), required_gross=Decimal(1), **flat)
+
+
+def test_leverage_widens_margin_but_never_the_stop_loss_risk():
+    from tests.test_live_risk import FixtureVerifier, _evaluate, _evaluator, _limits
+
+    one = _evaluate().decision
+    many = _evaluate(
+        _evaluator(verifier=FixtureVerifier(), limits=_limits(max_leverage=30.0)), leverage=5.0
+    ).decision
+    assert many.approved and many.leverage == 5.0
+    assert many.worst_case_loss_usd <= many.loss_budget_usd == one.loss_budget_usd
+    refused = _evaluate(leverage=5.0).decision
+    assert "leverage_outside_constitution" in refused.rejection_reasons, "the limits in force allow 1x"
+
+
+def test_a_stop_too_close_to_liquidation_is_refused():
+    from tests.test_live_risk import FixtureVerifier, _evaluate, _evaluator, _limits
+
+    tight = _evaluator(verifier=FixtureVerifier(), limits=_limits(max_leverage=30.0))
+    assert "stop_too_close_to_liquidation" in _evaluate(tight, leverage=20.0).decision.rejection_reasons

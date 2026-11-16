@@ -319,7 +319,7 @@ def test_default_missing_verifier_fails_closed_without_claiming_approval() -> No
     [
         ({"per_trade_risk_fraction": 0.0025001}, "per_trade_risk_fraction"),
         ({"aggregate_open_risk_fraction": 0.010001}, "aggregate_open_risk_fraction"),
-        ({"max_leverage": 1.01}, "max_leverage"),
+        ({"max_leverage": 30.01}, "max_leverage"),
         ({"daily_loss_cap_usd": 0.0}, "daily_loss_cap_usd"),
     ],
 )
