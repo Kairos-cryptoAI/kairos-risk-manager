@@ -6,7 +6,12 @@ from decimal import Decimal
 
 import pytest
 
-from kairos_risk.adaptive_risk import AdaptiveRiskPolicyV1, adapt_limits, adaptive_risk_fraction
+from kairos_risk.adaptive_risk import (
+    AdaptiveRiskPolicyV1,
+    adapt_limits,
+    adaptive_risk_fraction,
+    minimum_lot_fraction,
+)
 from kairos_risk.learning import (
     NO_EVIDENCE,
     LearningLedger,
@@ -227,3 +232,19 @@ def test_a_stop_too_close_to_liquidation_is_refused():
 
     tight = _evaluator(verifier=FixtureVerifier(), limits=_limits(max_leverage=30.0))
     assert "stop_too_close_to_liquidation" in _evaluate(tight, leverage=20.0).decision.rejection_reasons
+
+
+def test_minimum_lot_raises_the_share_only_within_the_ceiling_and_drawdown():
+    policy = AdaptiveRiskPolicyV1()
+    flat = dict(equity_usd=Decimal(100), peak_equity_usd=Decimal(100))
+    unproven = adaptive_risk_fraction(policy, NO_EVIDENCE, **flat)
+    assert minimum_lot_fraction(policy, unproven, needed_fraction=Decimal("0.001"), **flat) is unproven
+    raised = minimum_lot_fraction(policy, unproven, needed_fraction=Decimal("0.0019"), **flat)
+    assert raised.fraction == Decimal("0.0019") and "minimum lot" in raised.reasons[-1]
+    assert minimum_lot_fraction(policy, unproven, needed_fraction=Decimal("0.0026"), **flat) is None
+    # In a 2 % drawdown the cap halves: 0.00125, so the same need is refused.
+    down = dict(equity_usd=Decimal(98), peak_equity_usd=Decimal(100))
+    shrunk = adaptive_risk_fraction(policy, NO_EVIDENCE, **down)
+    assert minimum_lot_fraction(policy, shrunk, needed_fraction=Decimal("0.0019"), **down) is None
+    negative = adaptive_risk_fraction(policy, _edge([-0.3, 0.2] * 15), **flat)
+    assert minimum_lot_fraction(policy, negative, needed_fraction=Decimal("0.0001"), **flat) is None

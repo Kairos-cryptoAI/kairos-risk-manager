@@ -198,6 +198,39 @@ def adaptive_leverage(
     return AdaptiveLeverageDecisionV1(leverage, tuple(reasons))
 
 
+def minimum_lot_fraction(
+    policy: AdaptiveRiskPolicyV1,
+    decision: AdaptiveRiskDecisionV1,
+    *,
+    needed_fraction: Decimal,
+    equity_usd: Decimal,
+    peak_equity_usd: Decimal,
+) -> AdaptiveRiskDecisionV1 | None:
+    """The adaptive share raised just enough for the venue's minimum lot, or None.
+
+    A small account sized by the adaptive share alone can fall below the instrument's
+    minimum lot and never trade. The share may then rise to ``needed_fraction``, but never
+    above the constitution's ceiling, shrunk by drawdown exactly as the share is, and never
+    for a candidate the evidence refuses (a zero share).
+    """
+    needed = _decimal(needed_fraction, "needed_fraction").quantize(_QUANTUM, rounding=ROUND_CEILING)
+    equity, peak = _decimal(equity_usd, "equity_usd"), _decimal(peak_equity_usd, "peak_equity_usd")
+    if equity <= 0 or peak < equity or needed <= 0:
+        raise ValueError("a positive need, positive equity at most its durable peak")
+    if not decision.allows_entry:
+        return None
+    if needed <= decision.fraction:
+        return decision
+    cap = policy.ceiling_fraction / (1 + (peak - equity) / peak / policy.drawdown_halving_fraction)
+    if needed > cap:
+        return None
+    return AdaptiveRiskDecisionV1(
+        needed,
+        (needed / policy.ceiling_fraction).quantize(Decimal("0.0001")),
+        (*decision.reasons, f"raised to {needed} of equity for the venue's minimum lot (cap {cap:.6f})"),
+    )
+
+
 def adapt_limits(limits: LiveRiskLimitsV1, decision: AdaptiveRiskDecisionV1) -> LiveRiskLimitsV1 | None:
     """The same limits with the adaptive per-trade fraction, never above the original; None = no entry."""
     if not decision.allows_entry:
@@ -215,4 +248,5 @@ __all__ = [
     "adapt_limits",
     "adaptive_leverage",
     "adaptive_risk_fraction",
+    "minimum_lot_fraction",
 ]
