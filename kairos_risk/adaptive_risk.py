@@ -10,15 +10,18 @@ the system decides, from evidence only:
   durable peak, and keeps shrinking with deeper drawdown, so losses reduce risk and nothing
   ever tries to win them back;
 * **review priority** (0-100 from the Aggregator): a low-priority ALLOW uses less;
-* **venue cost**: spread and slippage above ``cost_halving_bps`` shrink the share.
+* **venue cost**: spread and slippage above ``cost_halving_bps`` shrink the share;
+* **minimum lot** (``minimum_lot_fraction``): a share too small for the venue's minimum
+  lot may rise to it, within the ceiling and its drawdown reduction only.
 
 The result never exceeds the ceiling and is rounded down. ``adapt_limits`` applies it to
 ``LiveRiskLimitsV1``; a zero result means no entry for this candidate.
 
 **Leverage** (``adaptive_leverage``) is decided the same way and is capped by the owner's
-constitution (``LiveRiskLimitsV1.max_leverage``, today exactly 1x): 1x without a proven
-positive edge or in a drawdown, more only as far as the open positions actually need it
-and the proven lower bound allows. Leverage never raises the per-trade risk, which is
+constitution (``LiveRiskLimitsV1.max_leverage``, at most 30x): only as much as the open
+positions and this trade need for margin, up to 3x without a proven edge, 1x for a proven
+non-positive edge, more as the proven lower bound grows, less in a drawdown, and never
+so much that the stop sits past half the way to liquidation. Leverage never raises the per-trade risk, which is
 set by the stop distance and the fraction above; it only lets the account hold the
 notional that this risk requires.
 """
