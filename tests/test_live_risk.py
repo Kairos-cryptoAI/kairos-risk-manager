@@ -783,3 +783,11 @@ def test_constitution_limit_aggregate_open_risk_refuses_entry_once_exhausted() -
     )
     assert not result.decision.approved and result.decision.quantity == 0
     assert "aggregate_open_risk_limit_exhausted" in result.decision.rejection_reasons
+
+
+def test_macro_gross_cap_below_one_caps_exposure_instead_of_refusing() -> None:
+    full = _evaluate().decision
+    capped = _evaluate(allocation=_allocation(max_gross_leverage=0.3)).decision
+    assert capped.approved and "macro_leverage_below_one" not in capped.rejection_reasons
+    assert capped.notional_usd <= 10_000 * (1 - 0.2) * 0.3 + 1e-6
+    assert capped.notional_usd <= full.notional_usd

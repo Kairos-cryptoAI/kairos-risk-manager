@@ -756,8 +756,8 @@ class LiveRiskEvaluator:
                 reasons.append("macro_regime_forbids_long")
             elif allocation.regime is MarketRegime.BULL and intent.side is Side.SHORT:
                 reasons.append("macro_regime_forbids_short")
-            if allocation.max_gross_leverage < 1.0:
-                reasons.append("macro_leverage_below_one")
+            # A gross-leverage cap below 1x is the Macro Strategist's exposure limit, not a
+            # refusal: ``_size`` caps the deployable notional by it.
 
     def _size(
         self,
