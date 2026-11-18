@@ -74,13 +74,16 @@ five seconds old. The quote's book and reference timestamps must each also be
 nonfuture and no more than two seconds old; a recently wrapped stale quote is
 not fresh. Account context must be exact and below the frozen equity
 ceiling. Allocation must be present, valid and fresh (26 hours maximum), give
-the strategy positive capital, permit the signal's regime/direction, and allow
-at least 1x leverage. Long/short stop and target geometry is rechecked against
+the strategy positive capital, permit the signal's direction (BEAR refuses
+longs, BULL refuses shorts, CHOP admits either side at half the per-trade
+budget), and allow at least 1x leverage. The Macro Strategist's defensive
+allocation (CHOP with no strategy weight) therefore still admits nothing. Long/short stop and target geometry is rechecked against
 the executable top of book.
 
 Sizing recomputes stop-distance loss plus entry/stop fees and measured
-side-specific slippage. It uses the minimum of the 0.25%-equity trade ceiling,
-explicit per-trade loss-dollar cap, 1%-equity remaining aggregate risk, and
+side-specific slippage. It uses the minimum of the 0.25%-equity trade ceiling
+and explicit per-trade loss-dollar cap (both halved by `CHOP_RISK_MULTIPLIER`
+in CHOP), 1%-equity remaining aggregate risk, and
 remaining daily-loss room after charging current adverse loss, existing open
 stop-risk, and unrepresented reservations. Quantity is rounded downward to 1e-8
 before economics are recomputed with decimal arithmetic, then represented
@@ -89,7 +92,8 @@ be converted finitely or conservative rounding would breach a hard ceiling.
 Notional is bounded by available balance, venue depth and assessed
 size, position and aggregate dollar caps, allocation gross capital, and
 strategy-weight capital, after subtracting only unrepresented reservations.
-Leverage is exactly 1x. No quota or minimum trade count is used; below-minimum
+Leverage is the caller's, within the constitution's maximum (30x) and with the
+stop no further than half the way to liquidation. No quota or minimum trade count is used; below-minimum
 capacity rejects rather than inflating quantity.
 
 ## Authenticated PROD instrument geometry

@@ -791,3 +791,35 @@ def test_macro_gross_cap_below_one_caps_exposure_instead_of_refusing() -> None:
     assert capped.approved and "macro_leverage_below_one" not in capped.rejection_reasons
     assert capped.notional_usd <= 10_000 * (1 - 0.2) * 0.3 + 1e-6
     assert capped.notional_usd <= full.notional_usd
+
+
+def test_chop_admits_an_entry_at_half_the_per_trade_loss_budget() -> None:
+    normal = _evaluate()
+    chop = _evaluate(allocation=_allocation(regime=MarketRegime.CHOP))
+    assert normal.decision.approved and chop.decision.approved
+    assert chop.decision.loss_budget_usd == pytest.approx(normal.decision.loss_budget_usd / 2)
+    assert 0 < chop.decision.quantity < normal.decision.quantity
+    assert chop.decision.worst_case_loss_usd <= chop.decision.loss_budget_usd
+
+
+def test_chop_halves_only_the_per_trade_budget_and_its_defensive_form_admits_nothing() -> None:
+    # The open-risk and daily rooms (20 USD here) are limits of their own, never halved.
+    bounded = _evaluate(
+        _evaluator(
+            verifier=FixtureVerifier(
+                aggregate_open_risk_usd=70.0,
+                reserved_open_risk_usd=10.0,
+                daily_adverse_loss_usd=900.0,
+            )
+        ),
+        allocation=_allocation(regime=MarketRegime.CHOP),
+    )
+    assert bounded.decision.approved
+    assert bounded.decision.loss_budget_usd == pytest.approx(_evaluate().decision.loss_budget_usd / 2)
+    assert bounded.decision.loss_budget_usd < 20.0
+    # The Macro Strategist's defensive allocation: CHOP, no strategy weight, all in reserve.
+    defensive = _evaluate(
+        allocation=_allocation(regime=MarketRegime.CHOP, stable_reserve_pct=1.0, strategy_weights={})
+    )
+    assert not defensive.decision.approved and defensive.decision.quantity == 0
+    assert "strategy_has_no_macro_allocation" in defensive.decision.rejection_reasons

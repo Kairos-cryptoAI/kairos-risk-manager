@@ -96,6 +96,10 @@ class LiveRiskScopeV1(StrictValueModel):
 CONSTITUTION_MAX_LEVERAGE = 30.0
 # A stop must sit at most this share of the way to the liquidation price (about 1/leverage).
 MAX_STOP_SHARE_OF_LIQUIDATION = 0.5
+# The owner's rule for a range-bound market (Macro regime CHOP): entries on either side are
+# allowed at half the per-trade loss budget. The Macro Strategist's own defensive allocation
+# (CHOP with no strategy weight, everything in reserve) still admits nothing.
+CHOP_RISK_MULTIPLIER = Decimal("0.5")
 
 
 class LiveRiskLimitsV1(StrictValueModel):
@@ -524,12 +528,13 @@ class LiveRiskEvaluator:
                     - _d(open_risk)
                     - _d(reserved_risk),
                 )
-                loss_budget_decimal = min(
+                per_trade_budget = min(
                     _d(equity) * _d(self.limits.per_trade_risk_fraction),
                     _d(self.limits.per_trade_dollar_cap_usd),
-                    aggregate_risk_room,
-                    daily_room,
                 )
+                if allocation.regime is MarketRegime.CHOP:
+                    per_trade_budget *= CHOP_RISK_MULTIPLIER
+                loss_budget_decimal = min(per_trade_budget, aggregate_risk_room, daily_room)
                 loss_budget = _lower_float(loss_budget_decimal)
                 if loss_budget <= 0:
                     reasons.append("risk_budget_exhausted")
@@ -770,9 +775,8 @@ class LiveRiskEvaluator:
                     reasons.append("strategic_allocation_stale")
             if allocation.strategy_weights.get(self.scope.strategy_id, 0.0) <= 0:
                 reasons.append("strategy_has_no_macro_allocation")
-            if allocation.regime is MarketRegime.CHOP:
-                reasons.append("macro_regime_chop")
-            elif allocation.regime is MarketRegime.BEAR and intent.side is Side.LONG:
+            # CHOP is not a refusal: the loss budget is halved (``CHOP_RISK_MULTIPLIER``).
+            if allocation.regime is MarketRegime.BEAR and intent.side is Side.LONG:
                 reasons.append("macro_regime_forbids_long")
             elif allocation.regime is MarketRegime.BULL and intent.side is Side.SHORT:
                 reasons.append("macro_regime_forbids_short")

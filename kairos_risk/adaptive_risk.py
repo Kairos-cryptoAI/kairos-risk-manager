@@ -21,9 +21,9 @@ The result never exceeds the ceiling and is rounded down. ``adapt_limits`` appli
 constitution (``LiveRiskLimitsV1.max_leverage``, at most 30x): only as much as the open
 positions and this trade need for margin, up to 3x without a proven edge, 1x for a proven
 non-positive edge, more as the proven lower bound grows, less in a drawdown, and never
-so much that the stop sits past half the way to liquidation. Leverage never raises the per-trade risk, which is
-set by the stop distance and the fraction above; it only lets the account hold the
-notional that this risk requires.
+so much that the stop sits past half the way to liquidation. Leverage never raises the
+per-trade risk, which is set by the stop distance and the fraction above; it only lets the
+account hold the notional that this risk requires.
 """
 
 from __future__ import annotations
