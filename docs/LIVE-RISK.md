@@ -74,11 +74,11 @@ five seconds old. The quote's book and reference timestamps must each also be
 nonfuture and no more than two seconds old; a recently wrapped stale quote is
 not fresh. Account context must be exact and below the frozen equity
 ceiling. Allocation must be present, valid and fresh (26 hours maximum), give
-the strategy positive capital, permit the signal's direction (BEAR refuses
-longs, BULL refuses shorts, CHOP admits either side at half the per-trade
-budget), and allow at least 1x leverage. The Macro Strategist's defensive
-allocation (CHOP with no strategy weight) therefore still admits nothing. Long/short stop and target geometry is rechecked against
-the executable top of book.
+the strategy positive capital and permit the signal's direction. BEAR refuses
+longs, BULL refuses shorts, and CHOP admits either side at half the per-trade
+budget. A gross leverage limit below 1x caps deployable notional. The defensive
+CHOP allocation gives the strategy zero weight and prevents entry. Risk also
+rechecks long and short stop and target geometry against the executable top of book.
 
 Sizing recomputes stop-distance loss plus entry/stop fees and measured
 side-specific slippage. It uses the minimum of the 0.25%-equity trade ceiling
