@@ -145,7 +145,7 @@ def adaptive_leverage(
     edge: EdgeEstimate,
     *,
     constitution_max: Decimal,
-    required_gross: Decimal,
+    required_gross: Decimal | None = None,
     equity_usd: Decimal,
     peak_equity_usd: Decimal,
     stop_fraction: Decimal | None = None,
@@ -153,8 +153,9 @@ def adaptive_leverage(
 ) -> AdaptiveLeverageDecisionV1:
     """This trade's account leverage: as much as the book needs, as little as possible.
 
-    ``required_gross`` is the open plus this trade's full-risk notional over equity: the
-    leverage that lets them all hold margin. It is capped by the evidence (3x without a
+    When supplied, ``required_gross`` is a caller's estimate of the leverage required.
+    Without an estimate, return the ceiling for the LIVE evaluator to fit to the
+    approved position and verified free margin. The ceiling follows the evidence (3x without a
     proven edge, up to the constitution as the proven lower bound grows, nothing beyond 1x
     for a proven non-positive edge), by drawdown (the evidence cap shrinks like the risk
     share), by the stop (it must sit at most half way to liquidation, about 1/leverage),
@@ -163,9 +164,9 @@ def adaptive_leverage(
     fraction set that.
     """
     cap = _decimal(constitution_max, "constitution_max")
-    need = _decimal(required_gross, "required_gross")
+    need = None if required_gross is None else _decimal(required_gross, "required_gross")
     equity, peak = _decimal(equity_usd, "equity_usd"), _decimal(peak_equity_usd, "peak_equity_usd")
-    if cap < 1 or need < 0 or equity <= 0 or peak < equity:
+    if cap < 1 or (need is not None and need < 0) or equity <= 0 or peak < equity:
         raise ValueError("leverage inputs: a cap of at least 1x, a non-negative need and valid equity")
     if cap == 1:
         return AdaptiveLeverageDecisionV1(Decimal(1), ("the constitution allows 1x only",))
@@ -195,6 +196,9 @@ def adaptive_leverage(
     if venue_max is not None and _decimal(venue_max, "venue_max") >= 1:
         caps.append(_decimal(venue_max, "venue_max"))
     ceiling = max(Decimal(1), min(caps).to_integral_value(rounding=ROUND_DOWN))
+    if need is None:
+        reasons.append(f"permitted margin leverage ceiling {ceiling}x")
+        return AdaptiveLeverageDecisionV1(ceiling, tuple(reasons))
     wanted = max(Decimal(1), need.to_integral_value(rounding=ROUND_CEILING))
     leverage = min(ceiling, wanted)
     reasons.append(f"the book needs {need:.2f}x of margin; ceiling {ceiling}x")

@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import UTC
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Protocol
 
 from kairos_core.contracts import (
@@ -378,13 +378,23 @@ class LiveRiskEvaluator:
         system_mode: SystemMode = SystemMode.NORMAL,
         raw_inputs_evidence: object | None = None,
         leverage: float = 1.0,
+        adaptive_leverage_ceiling: int | None = None,
     ) -> LiveRiskEvaluationV1:
-        """``leverage`` is this trade's account leverage (``adaptive_risk.adaptive_leverage``):
-        it sets the margin the position uses, never its stop-loss risk."""
+        """Use fixed leverage, or fit the approved notional to free margin within an adaptive ceiling."""
         if isinstance(decided_at_ms, bool) or not isinstance(decided_at_ms, int) or decided_at_ms < 0:
             raise ValueError("decided_at_ms must be a non-negative integer")
         if isinstance(leverage, bool) or not isinstance(leverage, int | float) or not math.isfinite(leverage):
             raise ValueError("leverage must be a finite number")
+        if adaptive_leverage_ceiling is not None:
+            if (
+                type(adaptive_leverage_ceiling) is not int
+                or not 1 <= adaptive_leverage_ceiling <= CONSTITUTION_MAX_LEVERAGE
+                or leverage != 1
+            ):
+                raise ValueError(
+                    "adaptive leverage needs an integer ceiling within 1..30 and no fixed leverage"
+                )
+            leverage = float(adaptive_leverage_ceiling)
         review = CandidateReviewV1.model_validate_json(review.model_dump_json())
         venue = VenueQualityV1.model_validate_json(venue.model_dump_json())
         if venue.profile is not EvedexProfile.PROD:
@@ -494,6 +504,11 @@ class LiveRiskEvaluator:
         open_notional = verified.aggregate_open_notional_usd if verified is not None else 0.0
         reserved_risk = verified.reserved_open_risk_usd if verified is not None else 0.0
         reserved_notional = verified.reserved_open_notional_usd if verified is not None else 0.0
+        free_margin = (
+            max(Decimal(0), _d(account.available_balance_usd) - _d(reserved_notional))
+            if account is not None
+            else Decimal(0)
+        )
         strategy_notional = verified.strategy_open_notional_usd if verified is not None else 0.0
         strategy_reserved_notional = verified.strategy_reserved_notional_usd if verified is not None else 0.0
         daily_adverse = verified.daily_adverse_loss_usd if verified is not None else 0.0
@@ -509,6 +524,11 @@ class LiveRiskEvaluator:
         if not 1.0 <= leverage <= self.limits.max_leverage:
             reasons.append("leverage_outside_constitution")
         stop_share = abs(_d(worst_entry) - _d(intent.exit_plan.stop_price)) / _d(worst_entry)
+        if adaptive_leverage_ceiling is not None and stop_share > 0:
+            stop_ceiling = (_d(MAX_STOP_SHARE_OF_LIQUIDATION) / stop_share).to_integral_value(
+                rounding=ROUND_DOWN
+            )
+            leverage = min(leverage, float(max(Decimal(1), stop_ceiling)))
         if leverage > 1 and stop_share * _d(leverage) > _d(MAX_STOP_SHARE_OF_LIQUIDATION):
             reasons.append("stop_too_close_to_liquidation")
 
@@ -545,6 +565,7 @@ class LiveRiskEvaluator:
                             venue=venue,
                             allocation=allocation,
                             account=verified.account,
+                            free_margin=free_margin,
                             open_notional=open_notional,
                             reserved_notional=reserved_notional,
                             strategy_notional=strategy_notional,
@@ -574,6 +595,11 @@ class LiveRiskEvaluator:
                 loss_budget = 0.0
 
         approved = not reasons
+        if adaptive_leverage_ceiling is not None:
+            leverage = 1.0
+            if approved:
+                # _size already bounded this positive notional by free_margin * ceiling.
+                leverage = float((_d(notional) / free_margin).to_integral_value(rounding=ROUND_CEILING))
         if not approved:
             quantity = notional = fees = slippage = worst_loss = 0.0
         account_id = self.scope.account_id
@@ -790,6 +816,7 @@ class LiveRiskEvaluator:
         venue: VenueQualityV1,
         allocation: StrategicAllocation,
         account: AccountSnapshotV2,
+        free_margin: Decimal,
         open_notional: float,
         reserved_notional: float,
         strategy_notional: float,
@@ -823,9 +850,6 @@ class LiveRiskEvaluator:
             - _d(strategy_reserved_notional),
         )
         # The margin this position may use: the free balance at this trade's leverage.
-        available_balance = max(
-            Decimal(0), (_d(account.available_balance_usd) - _d(reserved_notional)) * _d(leverage)
-        )
         notional_cap = min(
             _d(self.limits.max_position_notional_usd),
             max(
@@ -834,7 +858,7 @@ class LiveRiskEvaluator:
             ),
             _d(venue.assessed_notional_usd),
             _d(venue.depth_usd),
-            available_balance,
+            free_margin * _d(leverage),
             remaining_gross,
             remaining_strategy,
         )
